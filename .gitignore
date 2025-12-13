@@ -1,0 +1,17 @@
+# Build artifacts
+*.o
+*.exe
+os
+mem
+
+# Output files
+obj/
+output.txt
+
+# IDE
+.vscode/
+.vs/
+
+# OS specific
+.DS_Store
+Thumbs.db
