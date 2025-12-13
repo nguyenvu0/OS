@@ -1,0 +1,18 @@
+{
+    "files.associations": {
+        "typeinfo": "c",
+        "libmem.h": "c",
+        "queue.h": "c",
+        "syscall.h": "c",
+        "common.h": "c",
+        "stdlib.h": "c",
+        "*.lst": "c",
+        "mm.h": "c",
+        "string.h": "c",
+        "loader.h": "c",
+        "stdio.h": "c",
+        "pthread.h": "c",
+        "sched.h": "c",
+        "mem.h": "c"
+    }
+}
