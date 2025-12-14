@@ -1,0 +1,205 @@
+\section{Multi-Level Queue (MLQ) Scheduler}
+\label{sec:mlq-scheduler}
+
+\subsection{Giới thiệu về MLQ Scheduling}
+\label{subsec:mlq-intro}
+
+Multi-Level Queue (MLQ) là thuật toán lập lịch đa mức được sử dụng trong nhiều hệ điều hành hiện đại, bao gồm Linux kernel. Thuật toán này phân chia các tiến trình thành nhiều hàng đợi dựa trên mức độ ưu tiên, trong đó:
+
+\begin{itemize}
+    \item Mỗi mức độ ưu tiên có một hàng đợi riêng (ready queue)
+    \item Tiến trình với ưu tiên cao hơn (giá trị prio nhỏ hơn) được ưu tiên thực thi trước
+    \item Trong cùng một mức ưu tiên, sử dụng thuật toán Round Robin
+    \item Mỗi hàng đợi có số lượng time slot cố định dựa trên công thức: \texttt{slot = MAX\_PRIO - prio}
+\end{itemize}
+
+\subsection{Thiết kế và cài đặt}
+\label{subsec:mlq-implementation}
+
+\subsubsection{Cấu trúc dữ liệu}
+
+Hệ thống sử dụng các cấu trúc dữ liệu chính sau:
+
+\begin{lstlisting}[language=C, caption={Cấu trúc dữ liệu MLQ trong sched.c}]
+static struct queue_t ready_queue;
+static struct queue_t run_queue;
+static pthread_mutex_t queue_lock;
+
+#ifdef MLQ_SCHED
+static struct queue_t mlq_ready_queue[MAX_PRIO];
+static int slot[MAX_PRIO];
+#endif
+\end{lstlisting}
+
+Trong đó:
+\begin{itemize}
+    \item \mintinline{c}{mlq_ready_queue[MAX_PRIO]}: Mảng các hàng đợi ready, mỗi phần tử tương ứng với một mức ưu tiên
+    \item \mintinline{c}{slot[MAX_PRIO]}: Mảng lưu số slot còn lại cho mỗi mức ưu tiên
+    \item \mintinline{c}{queue_lock}: Mutex lock để đảm bảo thread-safe khi truy cập các hàng đợi
+\end{itemize}
+
+\subsubsection{Khởi tạo Scheduler}
+
+Hàm \mintinline{c}{init_scheduler()} khởi tạo các hàng đợi và slot cho từng mức ưu tiên:
+
+\begin{lstlisting}[language=C, caption={Khởi tạo MLQ Scheduler}]
+void init_scheduler(void) {
+#ifdef MLQ_SCHED
+    int i;
+    for (i = 0; i < MAX_PRIO; i++) {
+        mlq_ready_queue[i].size = 0;
+        slot[i] = MAX_PRIO - i;  // Higher prio gets more slots
+    }
+#endif
+    ready_queue.size = 0;
+    run_queue.size = 0;
+    pthread_mutex_init(&queue_lock, NULL);
+}
+\end{lstlisting}
+
+Công thức \texttt{slot[i] = MAX\_PRIO - i} đảm bảo:
+\begin{itemize}
+    \item Mức ưu tiên 0 (cao nhất) có \texttt{slot[0] = 140} time slices
+    \item Mức ưu tiên 139 (thấp nhất) có \texttt{slot[139] = 1} time slice
+\end{itemize}
+
+\subsubsection{Thuật toán lấy tiến trình (get\_mlq\_proc)}
+
+Hàm \mintinline{c}{get_mlq_proc()} là trung tâm của thuật toán MLQ:
+
+\begin{lstlisting}[language=C, caption={Thuật toán get\_mlq\_proc}]
+struct pcb_t *get_mlq_proc(void) {
+    struct pcb_t *proc = NULL;
+    
+    pthread_mutex_lock(&queue_lock);
+    
+    for (int i = 0; i < MAX_PRIO; i++) {
+        if (mlq_ready_queue[i].size > 0) {
+            if (slot[i] > 0) {
+                proc = dequeue(&mlq_ready_queue[i]);
+                slot[i]--;
+                break;
+            } else {
+                // Reset slot when expired
+                slot[i] = MAX_PRIO - i;
+                proc = dequeue(&mlq_ready_queue[i]);
+                slot[i]--;
+                break;
+            }
+        }
+    }
+    
+    pthread_mutex_unlock(&queue_lock);
+    return proc;
+}
+\end{lstlisting}
+
+\textbf{Phân tích thuật toán:}
+
+\begin{enumerate}
+    \item \textbf{Lock}: Sử dụng mutex lock để đảm bảo chỉ một CPU truy cập hàng đợi tại một thời điểm
+    \item \textbf{Duyệt từ cao đến thấp}: Lặp qua các mức ưu tiên từ 0 (cao nhất) đến MAX\_PRIO-1
+    \item \textbf{Kiểm tra slot}: 
+    \begin{itemize}
+        \item Nếu \texttt{slot[i] > 0}: Lấy tiến trình từ hàng đợi và giảm slot
+        \item Nếu \texttt{slot[i] == 0}: Reset slot về giá trị ban đầu, sau đó lấy tiến trình
+    \end{itemize}
+    \item \textbf{Unlock}: Giải phóng mutex lock
+\end{enumerate}
+
+\subsubsection{Thêm tiến trình vào hàng đợi}
+
+Hai hàm được sử dụng để thêm tiến trình:
+
+\begin{lstlisting}[language=C, caption={Thêm tiến trình vào MLQ}]
+void add_mlq_proc(struct pcb_t *proc) {
+    pthread_mutex_lock(&queue_lock);
+    enqueue(&mlq_ready_queue[proc->prio], proc);
+    pthread_mutex_unlock(&queue_lock);
+}
+
+void put_mlq_proc(struct pcb_t *proc) {
+    pthread_mutex_lock(&queue_lock);
+    enqueue(&mlq_ready_queue[proc->prio], proc);
+    pthread_mutex_unlock(&queue_lock);
+}
+\end{lstlisting}
+
+Cả hai hàm đều:
+\begin{itemize}
+    \item Sử dụng mutex lock để thread-safe
+    \item Thêm tiến trình vào hàng đợi tương ứng với mức ưu tiên của nó
+    \item \mintinline{c}{add_mlq_proc()}: Dùng cho tiến trình mới
+    \item \mintinline{c}{put_mlq_proc()}: Dùng cho tiến trình preempted (hết time slice)
+\end{itemize}
+
+\subsection{Thread Synchronization}
+\label{subsec:mlq-sync}
+
+Đồng bộ hóa là yếu tố quan trọng trong MLQ scheduler vì:
+
+\begin{itemize}
+    \item Hệ thống hỗ trợ đa CPU (multi-processor)
+    \item Nhiều CPU có thể đồng thời truy cập vào ready queues
+    \item Race condition có thể xảy ra nếu không có cơ chế bảo vệ
+\end{itemize}
+
+\textbf{Giải pháp:} Sử dụng \mintinline{c}{pthread_mutex_t queue_lock}:
+
+\begin{lstlisting}[language=C, caption={Critical Section Protection}]
+pthread_mutex_lock(&queue_lock);
+// Critical section: access to mlq_ready_queue
+proc = dequeue(&mlq_ready_queue[i]);
+pthread_mutex_unlock(&queue_lock);
+\end{lstlisting}
+
+\subsection{Ưu điểm của MLQ so với các thuật toán khác}
+\label{subsec:mlq-advantages}
+
+\textbf{Câu hỏi}: What are the advantages of using the scheduling algorithm described in this assignment compared to other scheduling algorithms you have learned?
+
+\textbf{Trả lời}:
+
+\begin{enumerate}
+    \item \textbf{So với FCFS (First Come First Served)}:
+    \begin{itemize}
+        \item MLQ cho phép ưu tiên các tiến trình quan trọng hơn
+        \item Giảm waiting time cho tiến trình có độ ưu tiên cao
+        \item Tránh convoy effect (tiến trình ngắn phải đợi tiến trình dài)
+    \end{itemize}
+    
+    \item \textbf{So với Round Robin đơn giản}:
+    \begin{itemize}
+        \item MLQ phân biệt được tiến trình theo mức độ quan trọng
+        \item Tiến trình ưu tiên cao được CPU nhiều hơn (nhiều slots hơn)
+        \item Phù hợp với real-time systems
+    \end{itemize}
+    
+    \item \textbf{So với Priority Scheduling thuần túy}:
+    \begin{itemize}
+        \item MLQ tránh starvation nhờ time slicing
+        \item Mỗi mức ưu tiên có được ít nhất 1 slot
+        \item Công bằng hơn cho các tiến trình ưu tiên thấp
+    \end{itemize}
+    
+    \item \textbf{Ưu điểm chung của MLQ}:
+    \begin{itemize}
+        \item Flexible: Có thể điều chỉnh số lượng slots cho mỗi mức ưu tiên
+        \item Scalable: Dễ dàng thêm/bớt mức ưu tiên
+        \item Predictable: Tiến trình ưu tiên cao luôn được đảm bảo CPU time
+        \item Fair: Tiến trình ưu tiên thấp vẫn có cơ hội chạy
+    \end{itemize}
+\end{enumerate}
+
+\subsection{Kết luận}
+\label{subsec:mlq-conclusion}
+
+MLQ scheduler đã được cài đặt thành công với đầy đủ các tính năng:
+\begin{itemize}
+    \item 140 mức độ ưu tiên
+    \item Time slicing dựa trên priority
+    \item Thread-safe với mutex locks
+    \item Round Robin trong cùng priority level
+\end{itemize}
+
+Thuật toán này phù hợp với các hệ thống cần phân biệt độ ưu tiên và đảm bảo fairness, đặc biệt trong môi trường multi-processor.

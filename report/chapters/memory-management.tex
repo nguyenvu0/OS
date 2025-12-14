@@ -1,0 +1,441 @@
+\section{Quản lý Bộ nhớ (Memory Management)}
+\label{sec:memory-management}
+
+\subsection{Tổng quan}
+\label{subsec:mm-overview}
+
+Hệ thống quản lý bộ nhớ trong Simple OS được thiết kế dựa trên kiến trúc phân đoạn kết hợp phân trang (Segmentation with Paging). Hệ thống bao gồm ba module chính:
+
+\begin{itemize}
+    \item \textbf{mm-vm.c}: Virtual memory operations
+    \item \textbf{mm.c}: Memory management core
+    \item \textbf{mm-memphy.c}: Physical memory và SWAP device
+    \item \textbf{mm64.c}: 64-bit paging support
+\end{itemize}
+
+\subsection{Cấu trúc Virtual Memory}
+\label{subsec:vm-structure}
+
+\subsubsection{Memory Area (vm\_area\_struct)}
+
+Mỗi tiến trình có không gian địa chỉ ảo được chia thành nhiều memory areas (segments):
+
+\begin{lstlisting}[language=C, caption={Virtual Memory Area Structure}]
+struct vm_area_struct {
+    unsigned long vm_id;        // Area ID
+    unsigned long vm_start;     // Start address
+    unsigned long vm_end;       // End address
+    unsigned long sbrk;         // Current break pointer
+    
+    struct mm_struct *vm_mm;    // Back pointer to mm_struct
+    struct vm_rg_struct *vm_freerg_list;  // Free regions
+    struct vm_area_struct *vm_next;       // Next area
+};
+\end{lstlisting}
+
+\textbf{Thiết kế đa segment:}
+
+\begin{figure}[H]
+\centering
+% Placeholder for diagram - user will add image later
+\fbox{\parbox{0.8\textwidth}{
+\centering
+\vspace{2cm}
+[Diagram: Virtual Memory Layout với nhiều vm\_area\_struct]\\
+\vspace{2cm}
+}}
+\caption{Cấu trúc Virtual Memory với nhiều segments}
+\label{fig:vm-layout}
+\end{figure}
+
+\textbf{Câu hỏi}: In this simple OS, we implement a design of multiple memory segments or memory areas in source code declaration. What is the advantage of the proposed design of multiple segments?
+
+\textbf{Trả lời}:
+
+\begin{enumerate}
+    \item \textbf{Tách biệt logic}:
+    \begin{itemize}
+        \item Code segment (read-only, executable)
+        \item Data segment (read-write, non-executable)
+        \item Stack segment (grow down)
+        \item Heap segment (grow up)
+    \end{itemize}
+    
+    \item \textbf{Bảo mật tốt hơn}:
+    \begin{itemize}
+        \item Memory protection: Mỗi segment có quyền truy cập riêng
+        \item Prevent code injection attacks
+        \item Isolate stack overflow từ heap
+    \end{itemize}
+    
+    \item \textbf{Quản lý linh hoạt}:
+    \begin{itemize}
+        \item Mỗi segment có thể grow độc lập
+        \item Dễ dàng implement \texttt{sbrk()} cho heap
+        \item Hỗ trợ shared libraries
+    \end{itemize}
+    
+    \item \textbf{Hiệu quả bộ nhớ}:
+    \begin{itemize}
+        \item Chỉ cấp phát physical memory cho vùng đang dùng
+        \item Giảm internal fragmentation
+        \item Hỗ trợ lazy allocation
+    \end{itemize}
+\end{enumerate}
+
+\subsubsection{Memory Region (vm\_rg\_struct)}
+
+Trong mỗi area, có nhiều regions đại diện cho các biến:
+
+\begin{lstlisting}[language=C, caption={Memory Region Structure}]
+struct vm_rg_struct {
+    unsigned long rg_start;  // Region start
+    unsigned long rg_end;    // Region end
+    struct vm_rg_struct *rg_next;
+};
+\end{lstlisting}
+
+\subsubsection{Memory Mapping (mm\_struct)}
+
+Cấu trúc tổng thể quản lý bộ nhớ của tiến trình:
+
+\begin{lstlisting}[language=C, caption={Memory Mapping Structure}]
+struct mm_struct {
+    uint64_t *pgd;  // Page Global Directory (for 64-bit)
+    
+    struct vm_area_struct *mmap;  // List of memory areas
+    
+    // Symbol table for regions (simplified)
+    struct vm_rg_struct symrgtbl[PAGING_MAX_SYMTBL_SZ];
+    
+    struct pgn_t *fifo_pgn;  // FIFO for page replacement
+};
+\end{lstlisting}
+
+\subsection{Physical Memory Management}
+\label{subsec:physical-mem}
+
+\subsubsection{Memory Physical Structure}
+
+\begin{lstlisting}[language=C, caption={Physical Memory Structure}]
+struct memphy_struct {
+    BYTE *storage;    // Actual memory storage
+    int maxsz;        // Maximum size
+    
+    // Sequential device support
+    int rdmflg;       // Random access flag
+    int cursor;       // Current position (for sequential)
+    
+    // Frame management
+    struct framephy_struct *free_fp_list;  // Free frames
+    struct framephy_struct *used_fp_list;  // Used frames
+};
+
+struct framephy_struct {
+    int fpn;                          // Frame number
+    struct framephy_struct *fp_next;  // Next frame
+};
+\end{lstlisting}
+
+\subsubsection{RAM và SWAP Devices}
+
+Hệ thống hỗ trợ:
+\begin{itemize}
+    \item \textbf{1 RAM device}: Primary memory, random access
+    \item \textbf{Up to 4 SWAP devices}: Secondary memory, sequential/random access
+\end{itemize}
+
+Cấu hình trong kernel structure:
+
+\begin{lstlisting}[language=C, caption={Kernel Physical Memory Configuration}]
+struct krnl_t {
+    // ... scheduler fields ...
+    
+    #ifdef MM_PAGING
+    struct mm_struct *mm;
+    struct memphy_struct *mram;           // Main RAM
+    struct memphy_struct **mswp;          // Array of SWAP devices
+    struct memphy_struct *active_mswp;    // Currently active SWAP
+    uint32_t active_mswp_id;
+    #endif
+};
+\end{lstlisting}
+
+\subsection{Paging-based Address Translation}
+\label{subsec:address-translation}
+
+\subsubsection{CPU Address Scheme}
+
+\textbf{32-bit CPU (256B page):}
+
+\begin{itemize}
+    \item \textbf{Bus width}: 22 bits → Max 4MB address space
+    \item \textbf{Page size}: 256B → 8-bit offset
+    \item \textbf{Page number}: 14 bits → 16,384 pages
+    \item \textbf{Page table}: 16,384 entries × 4B = 64KB
+\end{itemize}
+
+\textbf{64-bit CPU (4KB page):} (Đã trình bày chi tiết ở Chương 3)
+
+\subsubsection{Page Table Entry Format}
+
+\begin{lstlisting}[language=C, caption={32-bit PTE Format}]
+/*
+ * 32-bit Page Table Entry:
+ * 
+ * Bit 31:    Present bit
+ * Bit 30:    Swapped bit
+ * Bit 29:    Reserved
+ * Bit 28:    Dirty bit
+ * Bits 27-15: User-defined number
+ * Bits 14-13: Empty (reserved)
+ * Bits 12-0:  Frame Physical Number (if present)
+ * 
+ * When swapped:
+ * Bits 25-5:  Swap offset
+ * Bits 4-0:   Swap type
+ */
+\end{lstlisting}
+
+Macros để thao tác PTE:
+
+\begin{lstlisting}[language=C, caption={PTE Manipulation Macros}]
+// Extract FPN from PTE
+#define PAGING_PTE_FPN(pte) \
+    GETVAL(pte, PAGING_PTE_FPN_MASK, PAGING_PTE_FPN_LOBIT)
+
+// Set FPN in PTE
+int pte_set_fpn(pte_t *pte, int fpn) {
+    *pte = (*pte & ~PAGING_PTE_FPN_MASK) | 
+           ((fpn << PAGING_PTE_FPN_LOBIT) & PAGING_PTE_FPN_MASK);
+    return 0;
+}
+
+// Set present bit
+#define PAGING_PTE_SET_PRESENT(pte) \
+    (pte = pte | PAGING_PTE_PRESENT_MASK)
+\end{lstlisting}
+
+\subsection{Memory Operations}
+\label{subsec:memory-operations}
+
+Hệ thống hỗ trợ 4 operations cơ bản thông qua library \texttt{libmem}:
+
+\subsubsection{ALLOC - Cấp phát bộ nhớ}
+
+\textbf{Workflow:}
+
+\begin{enumerate}
+    \item User gọi hàm trong \texttt{libmem}
+    \item Tìm kiếm free region trong \texttt{vm\_freerg\_list}
+    \item Nếu không có:
+    \begin{itemize}
+        \item Gọi \texttt{SYSCALL MEMINC} để tăng vùng nhớ (inc\_vma\_limit)
+        \item Cấp phát physical frames
+        \item Ánh xạ vào page table
+    \end{itemize}
+    \item Trả về địa chỉ virtual của region
+\end{enumerate}
+
+\subsubsection{FREE - Giải phóng bộ nhớ}
+
+\textbf{Workflow:}
+
+\begin{enumerate}
+    \item User gọi hàm trong \texttt{libmem} với region ID
+    \item Đưa region vào \texttt{vm\_freerg\_list}
+    \item \textbf{Không} thu hồi physical frames (tránh memory holes)
+    \item Region có thể được tái sử dụng cho ALLOC sau
+\end{enumerate}
+
+\subsubsection{READ - Đọc bộ nhớ}
+
+\textbf{Workflow:}
+
+\begin{enumerate}
+    \item Tính địa chỉ: \texttt{addr = reg[source] + offset}
+    \item Trích xuất page number từ addr
+    \item Kiểm tra PTE:
+    \begin{itemize}
+        \item \textbf{Present bit = 1}: Lấy FPN, đọc data từ RAM
+        \item \textbf{Present bit = 0}: Page fault!
+        \begin{enumerate}
+            \item Gọi \texttt{SYSCALL MEMSWP}
+            \item Swap page từ SWAP vào RAM
+            \item Update PTE
+        \end{enumerate}
+    \end{itemize}
+    \item Gọi \texttt{SYSCALL MEMIO} để đọc data
+    \item Lưu vào \texttt{reg[destination]}
+\end{enumerate}
+
+\subsubsection{WRITE - Ghi bộ nhớ}
+
+Tương tự READ nhưng ghi data thay vì đọc, và set dirty bit trong PTE.
+
+\subsection{Memory Swapping}
+\label{subsec:memory-swapping}
+
+\subsubsection{Swap Copy Function}
+
+\begin{lstlisting}[language=C, caption={Swap Page between RAM and SWAP}]
+int __swap_cp_page(struct memphy_struct *mpsrc, int srcfpn,
+                   struct memphy_struct *mpdst, int dstfpn) {
+    int cellidx;
+    int addrsrc, addrdst;
+    
+    // Copy exactly PAGING_PAGESZ bytes (4KB for 64-bit)
+    for(cellidx = 0; cellidx < PAGING_PAGESZ; cellidx++) {
+        addrsrc = srcfpn * PAGING_PAGESZ + cellidx;
+        addrdst = dstfpn * PAGING_PAGESZ + cellidx;
+        
+        BYTE data;
+        MEMPHY_read(mpsrc, addrsrc, &data);
+        MEMPHY_write(mpdst, addrdst, data);
+    }
+    
+    return 0;
+}
+\end{lstlisting}
+
+\subsubsection{Find Victim Page}
+
+Sử dụng thuật toán FIFO để chọn page cần swap out:
+
+\begin{lstlisting}[language=C, caption={FIFO Page Replacement}]
+int find_victim_page(struct mm_struct *mm, int *pgn) {
+    struct pgn_t *pg = mm->fifo_pgn;
+    
+    if (pg == NULL) return -1;
+    
+    *pgn = pg->pgn;
+    
+    // Remove from FIFO and move to end
+    mm->fifo_pgn = pg->pg_next;
+    
+    return 0;
+}
+\end{lstlisting}
+
+\subsection{Thread Synchronization}
+\label{subsec:mm-synchronization}
+
+Memory management sử dụng \texttt{mm\_lock} để bảo vệ:
+
+\begin{lstlisting}[language=C, caption={Thread-safe Memory Operations}]
+static pthread_mutex_t mm_lock;
+
+int __alloc(struct pcb_t *caller, int vmaid, int rgid, 
+            int size, int *alloc_addr) {
+    pthread_mutex_lock(&mm_lock);
+    
+    // Critical section: modify memory structures
+    // - Update vm_freerg_list
+    // - Allocate frames
+    // - Update page table
+    
+    pthread_mutex_unlock(&mm_lock);
+    return 0;
+}
+\end{lstlisting}
+
+\subsection{User/Kernel Space Separation}
+\label{subsec:user-kernel-separation}
+
+\textbf{Yêu cầu quan trọng}: Memory space phải tách biệt giữa userspace và kernelspace.
+
+\textbf{Cài đặt}:
+
+\begin{itemize}
+    \item \textbf{Userspace}: Chỉ được truyền PID, không được truy cập trực tiếp PCB
+    \item \textbf{Kernelspace}: Sử dụng \texttt{struct krnl\_t} để quản lý toàn bộ hệ thống
+    \item \textbf{System calls}: Cầu nối giữa user và kernel
+\end{itemize}
+
+\begin{lstlisting}[language=C, caption={Kernel Structure}]
+struct krnl_t {
+    struct queue_t *ready_queue;
+    struct queue_t *running_list;
+    
+    #ifdef MLQ_SCHED
+    struct queue_t *mlq_ready_queue;
+    #endif
+    
+    #ifdef MM_PAGING
+    struct mm_struct *mm;              // Kernel's MM
+    struct memphy_struct *mram;        // Physical RAM
+    struct memphy_struct **mswp;       // SWAP devices
+    struct memphy_struct *active_mswp;
+    uint32_t active_mswp_id;
+    #endif
+};
+\end{lstlisting}
+
+\textbf{Đúng}: Userspace system call truyền PID, kernel traverse để lấy PCB
+
+\textbf{Sai}: Userspace trực tiếp truyền con trỏ PCB
+
+\subsection{Segmentation with Paging}
+\label{subsec:seg-with-paging}
+
+\textbf{Câu hỏi}: What are the advantages and disadvantages of segmentation with paging?
+
+\textbf{Trả lời}:
+
+\textbf{Ưu điểm:}
+
+\begin{enumerate}
+    \item \textbf{Kết hợp điểm mạnh của cả hai}:
+    \begin{itemize}
+        \item Segmentation: Logic separation, protection
+        \item Paging: No external fragmentation, simple allocation
+    \end{itemize}
+    
+    \item \textbf{Quản lý linh hoạt}:
+    \begin{itemize}
+        \item Segment có thể grow độc lập
+        \item Page-level granularity cho allocation
+    \end{itemize}
+    
+    \item \textbf{Protection tốt}:
+    \begin{itemize}
+        \item Segment-level: Read/Write/Execute permissions
+        \item Page-level: Present/Dirty/Swapped bits
+    \end{itemize}
+\end{enumerate}
+
+\textbf{Nhược điểm:}
+
+\begin{enumerate}
+    \item \textbf{Phức tạp}:
+    \begin{itemize}
+        \item Phải quản lý cả segment table và page table
+        \item Cài đặt phức tạp hơn
+    \end{itemize}
+    
+    \item \textbf{Overhead}:
+    \begin{itemize}
+        \item Address translation qua 2 bước: segment → page
+        \item Cần nhiều bộ nhớ cho tables
+    \end{itemize}
+    
+    \item \textbf{Internal fragmentation}:
+    \begin{itemize}
+        \item Vẫn còn internal fragmentation trong pages
+        \item Trung bình waste 0.5 page per segment
+    \end{itemize}
+\end{enumerate}
+
+\subsection{Kết luận}
+\label{subsec:mm-conclusion}
+
+Hệ thống quản lý bộ nhớ đã được cài đặt với:
+\begin{itemize}
+    \item Multi-segment architecture
+    \item Paging-based address translation (32-bit và 64-bit)
+    \item Swap mechanism với FIFO replacement
+    \item Thread-safe operations
+    \item User/kernel space separation
+\end{itemize}
+
+Thiết kế này đảm bảo tính bảo mật, hiệu quả và khả năng mở rộng cho hệ điều hành.

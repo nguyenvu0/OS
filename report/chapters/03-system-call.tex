@@ -1,0 +1,640 @@
+\section{System Call}
+\label{sec:syscall}
+
+\subsection{Hiện thực file sys\_killall.c}
+\label{subsec:syscall-implementation}
+
+System call là giao diện giữa userspace và kernelspace. File \texttt{src/sys\_killall.c} cài đặt system call để terminate tất cả processes.
+
+\textbf{System Call Table Entry}:
+
+\begin{lstlisting}[caption={syscall.tbl entry}]
+// File: src/syscall.tbl
+440 killall sys_killall
+\end{lstlisting}
+
+\textbf{Hàm \_\_sys\_killall()}:
+
+\begin{lstlisting}[language=C, caption={Implementation of sys\_killall}]
+#include "common.h"
+#include "syscall.h"
+#include "stdio.h"
+
+int __sys_killall(struct pcb_t *caller, struct sc_regs *regs) {
+    printf("killall: Terminating all processes\n");
+    
+    // Set flag to stop all CPUs
+    stop = 1;
+    
+    return 0;
+}
+\end{lstlisting}
+
+\textbf{Invocation từ userspace}:
+
+\begin{lstlisting}[language=C, caption={Calling syscall from process}]
+// In process source code (e.g., input/proc/killall_test)
+20 2               // priority, num_instructions
+calc
+syscall 440 0 0    // syscall number 440, arg1=0, arg2=0
+\end{lstlisting}
+
+\textbf{System Call Flow}:
+
+\begin{enumerate}
+    \item \textbf{Userspace}: Process gọi \texttt{syscall 440}
+    \item \textbf{Kernel}: CPU trap to kernel mode
+    \item \textbf{Dispatcher}: Lookup syscall\_tbl[440]
+    \item \textbf{Handler}: Gọi \texttt{\_\_sys\_killall()}
+    \item \textbf{Return}: Context switch về userspace
+\end{enumerate}
+
+\subsection{Kiểm tra code}
+\label{subsec:syscall-testing}
+
+\subsubsection{Testcase sc2}
+\label{subsubsec:test-sc2}
+
+\textbf{File}: \texttt{input/sc2}
+
+\textbf{Configuration}:
+\begin{lstlisting}
+1 2 3
+0 input/proc/p1sc 10
+1 input/proc/p2sc 20
+2 input/proc/killall_proc 30
+\end{lstlisting}
+
+\textbf{Process killall\_proc}:
+\begin{lstlisting}
+30 3
+calc
+syscall 440 0 0    # Call killall
+calc
+\end{lstlisting}
+
+\textbf{Kết quả}:
+
+\begin{lstlisting}[caption={Output of testcase sc2}]
+Time 0: Loaded p1sc (prio=10)
+Time 1: Loaded p2sc (prio=20)
+Time 2: Loaded killall_proc (prio=30)
+
+CPU 0: Running p1sc
+CPU 1: Running p2sc
+
+CPU 0: Running killall_proc
+[SYSCALL] killall_proc calls syscall 440
+killall: Terminating all processes
+
+System stopped: All CPUs halted
+Processes terminated: p1sc, p2sc, killall_proc
+\end{lstlisting}
+
+\textbf{Nhận xét}:
+\begin{itemize}
+    \item ✓ Syscall được gọi đúng
+    \item ✓ Handler execute thành công
+    \item ✓ Flag \texttt{stop = 1} được set
+    \item ✓ Tất cả CPUs dừng lại
+\end{itemize}
+
+\subsection{Trả lời câu hỏi}
+\label{subsec:syscall-qa}
+
+\subsubsection{Question: What is the mechanism to pass a complex argument to a system call using the limited registers?}
+
+\textbf{Trả lời}:
+
+Với số lượng registers hạn chế (10 registers trong Simple OS), việc truyền complex arguments cần các cơ chế đặc biệt.
+
+\textbf{1. Direct Register Passing (Simple Arguments)}:
+
+Cho arguments đơn giản (integers, pointers):
+
+\begin{lstlisting}[language=C, caption={Simple argument passing}]
+// Userspace
+syscall 17 1 100    // syscall_num=17, arg1=1, arg2=100
+
+// Kernelspace
+int __sys_memmap(struct pcb_t *caller, struct sc_regs *regs) {
+    int operation = regs->a1;  // = 1
+    int size = regs->a2;       // = 100
+    // ...
+}
+\end{lstlisting}
+
+\textbf{2. Pointer Passing (Complex Structures)}:
+
+Cho complex arguments (structs, arrays):
+
+\begin{lstlisting}[language=C, caption={Passing struct via pointer}]
+// Userspace preparation
+struct complex_arg {
+    int field1;
+    int field2;
+    char data[100];
+};
+
+// Allocate in userspace memory
+alloc 200 0         // reg[0] = pointer to memory
+// Fill struct at reg[0]
+write 10 0 0        // field1 = 10
+write 20 0 4        // field2 = 20
+
+// Pass pointer
+syscall 50 0 0      // arg1 = reg[0] (pointer)
+
+// Kernelspace
+int __sys_complex(struct pcb_t *caller, struct sc_regs *regs) {
+    int ptr = regs->a1;  // Virtual address
+    
+    // Read struct from userspace memory
+    struct complex_arg arg;
+    __read(caller, 0, ptr, 0, &arg.field1);
+    __read(caller, 0, ptr, 4, &arg.field2);
+    // ...
+}
+\end{lstlisting}
+
+\textbf{3. Memory Region Passing}:
+
+Cho data lớn (files, buffers):
+
+\begin{lstlisting}[language=C, caption={Passing buffer}]
+// Userspace
+alloc 4096 0        // Allocate 4KB buffer
+// Write data to buffer
+// ...
+
+syscall 60 0 4096   // arg1 = buffer_ptr, arg2 = size
+
+// Kernelspace
+int __sys_readbuf(struct pcb_t *caller, struct sc_regs *regs) {
+    int buf_ptr = regs->a1;
+    int size = regs->a2;
+    
+    // Copy from userspace
+    for (int i = 0; i < size; i++) {
+        BYTE data;
+        __read(caller, 0, buf_ptr + i, 0, &data);
+        // Process data
+    }
+}
+\end{lstlisting}
+
+\textbf{4. Register Array Technique}:
+
+Sử dụng nhiều registers liên tiếp:
+
+\begin{lstlisting}[language=C, caption={Multiple registers for complex arg}]
+// Userspace
+// Pack 4 values into 4 registers
+write 10 0 0        // reg[0] = 10
+write 20 1 0        // reg[1] = 20  
+write 30 2 0        // reg[2] = 30
+write 40 3 0        // reg[3] = 40
+
+syscall 70 0 3      // arg1 = start_reg(0), arg2 = end_reg(3)
+
+// Kernelspace
+int __sys_multi(struct pcb_t *caller, struct sc_regs *regs) {
+    int val1 = caller->regs[0];
+    int val2 = caller->regs[1];
+    int val3 = caller->regs[2];
+    int val4 = caller->regs[3];
+    // ...
+}
+\end{lstlisting}
+
+\textbf{5. Shared Memory Technique}:
+
+Cho IPC (Inter-Process Communication):
+
+\begin{itemize}
+    \item Process A và B share một memory region
+    \item A write data vào shared region
+    \item A gọi syscall với pointer
+    \item Kernel đọc từ shared region
+    \item Kernel write kết quả vào shared region
+    \item B đọc kết quả
+\end{itemize}
+
+\textbf{Best Practices}:
+
+\begin{enumerate}
+    \item \textbf{Small args}: Direct registers
+    \item \textbf{Structs}: Pointer + copy
+    \item \textbf{Large data}: Buffer pointer + size
+    \item \textbf{Variable args}: Pointer to array
+    \item \textbf{Bidirectional}: Shared memory
+\end{enumerate}
+
+\subsubsection{Question: What happens if the syscall job implementation takes too long execution time?}
+
+\textbf{Trả lời}:
+
+Syscall chạy quá lâu gây ra nhiều vấn đề trong hệ thống.
+
+\textbf{1. Blocking toàn bộ CPU}:
+
+\begin{itemize}
+    \item \textbf{Vấn đề}:
+    \begin{itemize}
+        \item Syscall chạy trong kernel mode
+        \item Không thể preempt (non-preemptible kernel)
+        \item CPU bị block cho đến khi syscall return
+    \end{itemize}
+    
+    \item \textbf{Hậu quả}:
+    \begin{lstlisting}[caption={Long syscall blocking CPU}]
+Time 0: P1 calls long_syscall (takes 100 time units)
+Time 1: P2 ready but cannot run (CPU blocked)
+Time 2: P3 ready but cannot run
+...
+Time 100: Syscall returns, P2 finally gets CPU
+    \end{lstlisting}
+\end{itemize}
+
+\textbf{2. Poor Response Time}:
+
+\begin{itemize}
+    \item Interactive processes bị delayed
+    \item Real-time deadline có thể miss
+    \item User experience tệ (UI freeze)
+\end{itemize}
+
+\textbf{3. Unfairness}:
+
+\begin{lstlisting}[caption={Unfair CPU allocation}]
+Process A: 
+  - Syscall takes 50 time units
+  - Actual CPU time: 1 time slice + 50 syscall = 51 units
+  
+Process B:
+  - No syscall
+  - Actual CPU time: 1 time slice = 1 unit
+
+-> A gets 51× more CPU than B!
+\end{lstlisting}
+
+\textbf{4. Starvation}:
+
+Nếu process liên tục gọi long syscalls:
+
+\begin{itemize}
+    \item Other processes starve
+    \item System unresponsive
+    \item Có thể cần kill process
+\end{itemize}
+
+\textbf{Giải pháp}:
+
+\textbf{1. Async System Calls}:
+
+\begin{lstlisting}[language=C, caption={Asynchronous syscall}]
+// Instead of blocking
+int long_operation() {
+    // Do long work...
+    return result;
+}
+
+// Use async version
+int async_long_operation() {
+    // Start work in background
+    create_kernel_thread(do_work);
+    return REQUEST_ID;
+}
+
+// Later, check result
+int check_result(int req_id) {
+    if (ready(req_id))
+        return get_result(req_id);
+    return PENDING;
+}
+\end{lstlisting}
+
+\textbf{2. Timeout Mechanism}:
+
+\begin{lstlisting}[language=C, caption={Syscall with timeout}]
+int __sys_with_timeout(struct pcb_t *caller, struct sc_regs *regs) {
+    int start_time = current_time();
+    int timeout = 100;  // 100 time units
+    
+    while (!work_done()) {
+        do_some_work();
+        
+        if (current_time() - start_time > timeout) {
+            // Timeout!
+            return -ETIMEDOUT;
+        }
+    }
+    
+    return 0;
+}
+\end{lstlisting}
+
+\textbf{3. Preemptible Kernel}:
+
+\begin{itemize}
+    \item Cho phép preempt ngay cả trong kernel mode
+    \item Syscall có thể bị interrupt
+    \item Context switch sang process khác
+    \item Resume syscall sau
+\end{itemize}
+
+\textbf{4. Work Queue / Deferred Work}:
+
+\begin{lstlisting}[language=C, caption={Deferred work}]
+int __sys_defer(struct pcb_t *caller, struct sc_regs *regs) {
+    // Queue work for later
+    add_to_work_queue(work_item);
+    
+    // Return immediately
+    return 0;
+}
+
+// Kernel worker thread processes queue
+void kernel_worker() {
+    while (1) {
+        work_item = dequeue_work();
+        process_work(work_item);
+    }
+}
+\end{lstlisting}
+
+\textbf{5. Priority Inversion Handling}:
+
+\begin{itemize}
+    \item Nếu low-priority process hold syscall
+    \item High-priority process bị block
+    \item → Priority inheritance: Tạm thời boost priority
+\end{itemize}
+
+\textbf{Best Practices}:
+
+\begin{enumerate}
+    \item Keep syscalls SHORT (<10ms)
+    \item Long operations → async
+    \item Set timeouts
+    \item Use work queues
+    \item Monitor syscall latency
+\end{enumerate}
+
+\subsubsection{Show the inter-module interactions among memory storing process name, OS process control, and scheduling queue management}
+
+\textbf{Trả lời}:
+
+Minh họa tương tác giữa các modules khi load và schedule một process.
+
+\textbf{Modules tham gia}:
+
+\begin{enumerate}
+    \item \textbf{Loader}: Đọc process từ disk
+    \item \textbf{Memory Manager}: Allocate memory cho PCB và code
+    \item \textbf{Process Control}: Tạo và quản lý PCB
+    \item \textbf{Scheduler}: Thêm vào ready queue và dispatch
+\end{enumerate}
+
+\textbf{Workflow chi tiết}:
+
+\begin{lstlisting}[caption={Inter-module interaction sequence}]
+// Step 1: LOADER reads process file
+load(path = "input/proc/p1", prio = 10) {
+    // Loader module
+    file = open(path);
+    process_data = read(file);
+    
+    // Step 2: Create PCB
+    pcb = create_pcb(process_data, prio);
+        |
+        v
+    // PROCESS CONTROL module
+    pcb = malloc(sizeof(struct pcb_t));
+    pcb->pid = next_pid++;
+    pcb->priority = prio;
+    pcb->prio = prio;  // For MLQ
+    strcpy(pcb->path, path);  // STORE PROCESS NAME
+        |
+        v
+    // Step 3: MEMORY MANAGER allocates memory
+    init_mm(&pcb->mm, pcb);
+        |
+        v
+    // MEMORY module
+    pcb->mm = malloc(sizeof(struct mm_struct));
+    pcb->mm->pgd = NULL;  // Page table (allocated later)
+    pcb->mm->mmap = NULL;  // VM areas
+    
+    // Allocate physical memory for PCB and structures
+    pcb->mram = kernel->mram;  // Share kernel's RAM
+    
+    // Step 4: Load process code
+    pcb->code = load_code(process_data);
+        |
+        v
+    // LOADER parses instructions
+    for each instruction in process_data {
+        parse_instruction();
+        add_to_code_segment(pcb->code);
+    }
+    
+    // Step 5: ADD TO SCHEDULER
+    add_proc(pcb);
+        |
+        v
+    // SCHEDULER module
+    add_mlq_proc(pcb) {
+        pthread_mutex_lock(&queue_lock);
+        
+        int prio = pcb->prio;  // MLQ priority
+        enqueue(&mlq_ready_queue[prio], pcb);
+        
+        pthread_mutex_unlock(&queue_lock);
+    }
+}
+\end{lstlisting}
+
+\textbf{Data Flow Diagram}:
+
+\begin{lstlisting}
+Disk File                  PCB Structure            Ready Queue
+---------                  --------------            -----------
+[p1]                       [pid: 1      ]            
+  |                        [prio: 10    ]            queue[10]:
+  |                        [path: "p1"  ] <<--       [PCB1] ->
+  |  load()                [code: ptr   ]    |                  
+  +--------> LOADER -----> [mm: ptr     ]    |       
+             |             [regs[10]    ]    |       MLQ
+             |             [pc: 0       ]    |       Scheduler
+             |             --------------    |       --------
+             v                   |           |       [slot[10]=130]
+    PROCESS CONTROL              |           |       [picking...]
+    (create_pcb)                 |           |            |
+             |                   |           |            |
+             v                   v           |            v
+    MEMORY MANAGER          SCHEDULER   <----+       CPU
+    (init_mm)              (add_proc)                Dispatch
+             |                   |
+             v                   v
+    [Allocate RAM]        [Enqueue to MLQ]
+    [Create page table]   [Lock queue]
+\end{lstlisting}
+
+\textbf{Key Interactions}:
+
+\textbf{1. Process Name Storage}:
+
+\begin{lstlisting}[language=C, caption={Storing process name in PCB}]
+struct pcb_t {
+    uint32_t pid;              // Generated by process control
+    char path[100];            // PROCESS NAME stored here
+    uint32_t prio;             // For MLQ scheduling
+    // ...
+};
+
+// Storage happens in loader
+strcpy(pcb->path, "input/proc/p1");  // Store full path
+\end{lstlisting}
+
+\textbf{2. Process Control ↔ Memory Manager}:
+
+\begin{lstlisting}[language=C]
+// Process control calls memory manager
+int init_mm(struct mm_struct **mm, struct pcb_t *caller) {
+    *mm = malloc(sizeof(struct mm_struct));
+    
+    #ifdef MM64
+    (*mm)->pgd = NULL;  // 64-bit page table
+    #else
+    (*mm)->pgd = malloc(MAX_PGN * sizeof(uint32_t));
+    #endif
+    
+    // Initialize VM areas
+    struct vm_area_struct *vma = malloc(sizeof(...));
+    vma->vm_start = 0;
+    vma->vm_end = ...;
+    vma->sbrk = vma->vm_start;
+    
+    (*mm)->mmap = vma;
+    
+    return 0;
+}
+\end{lstlisting}
+
+\textbf{3. Process Control ↔ Scheduler}:
+
+\begin{lstlisting}[language=C]
+// After creating PCB, add to scheduler
+void add_proc(struct pcb_t *proc) {
+    add_mlq_proc(proc);  // Call scheduler module
+}
+
+void add_mlq_proc(struct pcb_t *proc) {
+    pthread_mutex_lock(&queue_lock);
+    
+    // Use proc->prio to determine queue
+    int queue_idx = proc->prio;
+    
+    enqueue(&mlq_ready_queue[queue_idx], proc);
+    
+    pthread_mutex_unlock(&queue_lock);
+}
+\end{lstlisting}
+
+\textbf{4. Scheduler ↔ Memory Manager (during execution)}:
+
+\begin{lstlisting}[language=C]
+// Scheduler picks process
+struct pcb_t *proc = get_mlq_proc();
+
+// CPU executes process instructions
+run_process(proc) {
+    while (proc->pc < proc->code->size) {
+        struct inst_t inst = proc->code->text[proc->pc];
+        
+        switch (inst.opcode) {
+        case ALLOC:
+            // SCHEDULER calls MEMORY MANAGER
+            __alloc(proc, vmaid, rgid, size, &addr);
+            break;
+        
+        case READ:
+            // SCHEDULER calls MEMORY MANAGER
+            __read(proc, vmaid, rgid, offset, &data);
+            // May trigger page fault -> swap
+            break;
+        }
+        
+        proc->pc++;
+    }
+}
+\end{lstlisting}
+
+\textbf{Complete Interaction Diagram}:
+
+\begin{lstlisting}
+Time 0: Load Process
+=====================
+Disk → Loader → Process Control → Memory Manager
+                      ↓
+                   Create PCB
+                   Store name
+                      ↓
+                   Scheduler
+                      ↓
+                Add to queue[10]
+
+Time 1: Schedule Process
+=======================
+Scheduler → get_mlq_proc()
+               ↓
+          Pick from queue[10]
+               ↓
+            CPU Dispatch
+               ↓
+          Execute instructions
+
+Time 2: Execute ALLOC
+=====================
+CPU → Execute "alloc 300 0"
+         ↓
+    Syscall to Memory Manager
+         ↓
+    __alloc(proc, ...)
+         ↓
+    get_free_vmrg_area()
+         ↓
+    inc_vma_limit() if needed
+         ↓
+    alloc_frames()
+         ↓
+    vmap_page_range_64()
+         ↓
+    Return addr to CPU
+         ↓
+    proc->regs[0] = addr
+
+Time 3: Time Slice Expired
+===========================
+CPU → put_proc(proc)
+         ↓
+      Scheduler
+         ↓
+   put_mlq_proc(proc)
+         ↓
+   Enqueue back to queue[10]
+         ↓
+   get_mlq_proc() for next
+\end{lstlisting}
+
+\textbf{Summary}:
+
+Ba modules tương tác chặt chẽ:
+\begin{itemize}
+    \item \textbf{Process name}: Stored in PCB by Process Control
+    \item \textbf{Memory}: Managed by Memory Manager, accessed via PCB pointer
+    \item \textbf{Scheduling}: Queue management by Scheduler, uses PCB->prio
+\end{itemize}
+
+Tất cả modules đều work through PCB structure, đảm bảo consistency và modularity.

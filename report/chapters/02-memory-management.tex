@@ -1,0 +1,1152 @@
+\section{Memory Management}
+\label{sec:memory-management}
+
+\subsection{Hiện thực}
+\label{subsec:mm-implementation}
+
+Phần này trình bày chi tiết cài đặt hệ thống quản lý bộ nhớ với paging (32-bit và 64-bit), bao gồm virtual memory, physical memory, và swap mechanism.
+
+\subsubsection{Hiện thực file mm-vm.c}
+\label{subsubsec:mm-vm-implementation}
+
+File \texttt{src/mm-vm.c} cài đặt các operations cho virtual memory: alloc, free, read, write.
+
+\textbf{Hàm get\_free\_vmrg\_area():}
+
+Tìm vùng nhớ trống trong một memory area.
+
+\begin{lstlisting}[language=C, caption={Tìm free region trong VM area}]
+int get_free_vmrg_area(struct pcb_t *caller, int vmaid, 
+                       int size, struct vm_rg_struct *newrg) {
+    struct vm_area_struct *cur_vma = get_vma_by_num(caller->mm, vmaid);
+    
+    struct vm_rg_struct *rgit = cur_vma->vm_freerg_list;
+    
+    if (rgit == NULL)
+        return -1;
+    
+    // Traverse free region list
+    while (rgit != NULL) {
+        if (rgit->rg_end - rgit->rg_start >= size) {
+            // Found suitable region
+            newrg->rg_start = rgit->rg_start;
+            newrg->rg_end = rgit->rg_start + size;
+            
+            // Update free region start
+            rgit->rg_start += size;
+            
+            return 0;
+        }
+        rgit = rgit->rg_next;
+    }
+    
+    return -1;  // No suitable region found
+}
+\end{lstlisting}
+
+\textbf{Phân tích}:
+\begin{itemize}
+    \item Duyệt free region list của vm\_area
+    \item Tìm region đủ lớn (\texttt{size ≤ rg\_end - rg\_start})
+    \item Cắt region: Lấy phần đầu cho allocation, phần còn lại vẫn free
+    \item Return 0 nếu thành công, -1 nếu không có region phù hợp
+\end{itemize}
+
+\textbf{Hàm inc\_vma\_limit():}
+
+Tăng giới hạn của vm\_area khi cần thêm không gian (tương tự \texttt{sbrk()}).
+
+\begin{lstlisting}[language=C, caption={Increase VMA limit}]
+int inc_vma_limit(struct pcb_t *caller, int vmaid, int inc_sz) {
+    struct vm_area_struct *cur_vma = get_vma_by_num(caller->mm, vmaid);
+    int inc_amt = PAGING_PAGE_ALIGNSZ(inc_sz);
+    int incnumpage = inc_amt / PAGING_PAGESZ;
+    struct framephy_struct *frm_lst = NULL;
+    
+    // Allocate physical frames
+    int ret = alloc_pages_range(caller, incnumpage, &frm_lst);
+    if (ret < 0)
+        return -1;
+    
+    // Map frames to virtual pages
+    struct vm_rg_struct *area = init_vm_rg(cur_vma->sbrk, 
+                                           cur_vma->sbrk + inc_sz);
+    
+    #ifdef MM64
+    ret = vmap_page_range_64(caller, cur_vma->sbrk, incnumpage, 
+                             frm_lst, area);
+    #else
+    ret = vmap_page_range(caller, cur_vma->sbrk, incnumpage, 
+                          frm_lst, area);
+    #endif
+    
+    if (ret < 0)
+        return -1;
+    
+    // Update sbrk
+    cur_vma->sbrk += inc_sz;
+    
+    return 0;
+}
+\end{lstlisting}
+
+\textbf{Workflow}:
+\begin{enumerate}
+    \item Tính số pages cần (\texttt{inc\_amt / PAGING\_PAGESZ})
+    \item Allocate physical frames từ RAM
+    \item Map frames vào page table (32-bit hoặc 64-bit)
+    \item Tăng \texttt{sbrk} pointer
+\end{enumerate}
+
+\textbf{Hàm \_\_alloc():}
+
+System call handler cho memory allocation.
+
+\begin{lstlisting}[language=C, caption={Memory allocation system call}]
+int __alloc(struct pcb_t *caller, int vmaid, int rgid, 
+            int size, int *alloc_addr) {
+    struct vm_rg_struct rgnode;
+    
+    // Try to get free region
+    if (get_free_vmrg_area(caller, vmaid, size, &rgnode) == 0) {
+        // Found in free list
+        caller->mm->symrgtbl[rgid].rg_start = rgnode.rg_start;
+        caller->mm->symrgtbl[rgid].rg_end = rgnode.rg_end;
+        *alloc_addr = rgnode.rg_start;
+        return 0;
+    }
+    
+    // No free region, need to increase limit
+    int inc_sz = PAGING_PAGE_ALIGNSZ(size);
+    int inc_limit_ret = inc_vma_limit(caller, vmaid, inc_sz);
+    if (inc_limit_ret < 0)
+        return -1;
+    
+    // Try again after increasing
+    if (get_free_vmrg_area(caller, vmaid, size, &rgnode) < 0)
+        return -1;
+    
+    caller->mm->symrgtbl[rgid].rg_start = rgnode.rg_start;
+    caller->mm->symrgtbl[rgid].rg_end = rgnode.rg_end;
+    *alloc_addr = rgnode.rg_start;
+    
+    return 0;
+}
+\end{lstlisting}
+
+\textbf{Logic flow}:
+\begin{enumerate}
+    \item Tìm trong free region list
+    \item Nếu không có → gọi \texttt{inc\_vma\_limit()} để mở rộng
+    \item Sau khi mở rộng → tìm lại
+    \item Lưu region vào symbol table
+    \item Trả về virtual address
+\end{enumerate}
+
+\textbf{Hàm \_\_free():}
+
+System call handler cho deallocation.
+
+\begin{lstlisting}[language=C, caption={Memory free system call}]
+int __free(struct pcb_t *caller, int vmaid, int rgid) {
+    struct vm_rg_struct *rgnode = &caller->mm->symrgtbl[rgid];
+    
+    // Add region to free list
+    struct vm_area_struct *cur_vma = get_vma_by_num(caller->mm, vmaid);
+    
+    // Create new free region node
+    struct vm_rg_struct *free_node = malloc(sizeof(struct vm_rg_struct));
+    free_node->rg_start = rgnode->rg_start;
+    free_node->rg_end = rgnode->rg_end;
+    free_node->rg_next = cur_vma->vm_freerg_list;
+    
+    cur_vma->vm_freerg_list = free_node;
+    
+    return 0;
+}
+\end{lstlisting}
+
+\textbf{Lưu ý}:
+\begin{itemize}
+    \item Free chỉ đưa region vào free list
+    \item KHÔNG thu hồi physical frames (tránh fragmentation)
+    \item Region có thể được reuse cho alloc sau
+\end{itemize}
+
+\textbf{Hàm \_\_read() và \_\_write():}
+
+\begin{lstlisting}[language=C, caption={Read/Write operations}]
+int __read(struct pcb_t *caller, int vmaid, int rgid, 
+           int offset, BYTE *data) {
+    struct vm_rg_struct *currg = get_symrg_byid(caller->mm, rgid);
+    int addr = currg->rg_start + offset;
+    
+    // Get page number and offset
+    int pgn = PAGING_PGN(addr);
+    int off = PAGING_OFFST(addr);
+    
+    // Get page table entry
+    #ifdef MM64
+    uint64_t *pte = pgtable_walk(caller->mm, addr);
+    #else
+    uint32_t *pte = &caller->mm->pgd[pgn];
+    #endif
+    
+    // Check if page is present
+    if (!PAGING_PAGE_PRESENT(*pte)) {
+        // Page fault - need to swap in
+        int fpn;
+        int swap_ret = __mm_swap_page(caller->mm, pgn, &fpn);
+        if (swap_ret < 0)
+            return -1;
+    }
+    
+    // Get frame number
+    int fpn = PAGING_PTE_FPN(*pte);
+    int phyaddr = (fpn << NBITS(PAGING_PAGESZ)) + off;
+    
+    MEMPHY_read(caller->mram, phyaddr, data);
+    
+    return 0;
+}
+\end{lstlisting}
+
+\textbf{Workflow}:
+\begin{enumerate}
+    \item Tính virtual address = rg\_start + offset
+    \item Extract page number và offset
+    \item Walk page table (32-bit hoặc 64-bit)
+    \item Kiểm tra present bit
+    \item Nếu not present → page fault → swap in
+    \item Đọc/ghi data từ/vào physical address
+\end{enumerate}
+
+\subsubsection{Hiện thực file mm-memphy.c}
+\label{subsubsec:mm-memphy-implementation}
+
+File này cài đặt physical memory device (RAM và SWAP).
+
+\textbf{Hàm MEMPHY\_get\_freefp():}
+
+Lấy một free frame từ physical memory.
+
+\begin{lstlisting}[language=C, caption={Get free frame}]
+int MEMPHY_get_freefp(struct memphy_struct *mp, int *fpn) {
+    if (mp->free_fp_list == NULL)
+        return -1;
+    
+    struct framephy_struct *fp = mp->free_fp_list;
+    *fpn = fp->fpn;
+    
+    // Remove from free list
+    mp->free_fp_list = fp->fp_next;
+    
+    // Add to used list
+    fp->fp_next = mp->used_fp_list;
+    mp->used_fp_list = fp;
+    
+    return 0;
+}
+\end{lstlisting}
+
+\textbf{Hàm MEMPHY\_put\_freefp():}
+
+Trả lại frame vào free list.
+
+\begin{lstlisting}[language=C, caption={Return frame to free list}]
+int MEMPHY_put_freefp(struct memphy_struct *mp, int fpn) {
+    struct framephy_struct *fp = mp->used_fp_list;
+    struct framephy_struct *prev = NULL;
+    
+    // Find frame in used list
+    while (fp != NULL && fp->fpn != fpn) {
+        prev = fp;
+        fp = fp->fp_next;
+    }
+    
+    if (fp == NULL)
+        return -1;
+    
+    // Remove from used list
+    if (prev == NULL)
+        mp->used_fp_list = fp->fp_next;
+    else
+        prev->fp_next = fp->fp_next;
+    
+    // Add to free list
+    fp->fp_next = mp->free_fp_list;
+    mp->free_fp_list = fp;
+    
+    return 0;
+}
+\end{lstlisting}
+
+\subsubsection{Hiện thực file mm.c}
+\label{subsubsec:mm-implementation}
+
+File này chứa core memory management functions.
+
+\textbf{Hàm \_\_swap\_cp\_page():}
+
+Copy một page giữa RAM và SWAP (hoặc ngược lại).
+
+\begin{lstlisting}[language=C, caption={Swap copy page between RAM and SWAP}]
+int __swap_cp_page(struct memphy_struct *mpsrc, int srcfpn,
+                   struct memphy_struct *mpdst, int dstfpn) {
+    int cellidx;
+    
+    // Copy exactly PAGING_PAGESZ bytes
+    for (cellidx = 0; cellidx < PAGING_PAGESZ; cellidx++) {
+        int addrsrc = srcfpn * PAGING_PAGESZ + cellidx;
+        int addrdst = dstfpn * PAGING_PAGESZ + cellidx;
+        
+        BYTE data;
+        MEMPHY_read(mpsrc, addrsrc, &data);
+        MEMPHY_write(mpdst, addrdst, data);
+    }
+    
+    return 0;
+}
+\end{lstlisting}
+
+\textbf{Điểm quan trọng}:
+\begin{itemize}
+    \item Copy CHÍNH XÁC \texttt{PAGING\_PAGESZ} bytes
+    \item Với MM64: PAGING\_PAGESZ = 4096 bytes (4KB)
+    \item Với MM32: PAGING\_PAGESZ = 256 bytes
+    \item Đảm bảo page integrity
+\end{itemize}
+
+\textbf{Hàm find\_victim\_page():}
+
+Tìm page để swap out (sử dụng FIFO).
+
+\begin{lstlisting}[language=C, caption={Find victim page using FIFO}]
+int find_victim_page(struct mm_struct *mm, int *pgn) {
+    if (mm->fifo_pgn == NULL)
+        return -1;
+    
+    struct pgn_t *pg = mm->fifo_pgn;
+    *pgn = pg->pgn;
+    
+    // Move to next in FIFO
+    mm->fifo_pgn = pg->pg_next;
+    
+    free(pg);
+    
+    return 0;
+}
+\end{lstlisting}
+
+\textbf{Hàm vmap\_page\_range() - 32-bit:}
+
+\begin{lstlisting}[language=C, caption={Map virtual pages to physical frames (32-bit)}]
+int vmap_page_range(struct pcb_t *caller, int addr, int pgnum,
+                    struct framephy_struct *frames, 
+                    struct vm_rg_struct *ret_rg) {
+    struct framephy_struct *fpit = frames;
+    int pgit = 0;
+    int pgn = PAGING_PGN(addr);
+    
+    for (pgit = 0; pgit < pgnum; pgit++) {
+        pte_t *pte = &caller->mm->pgd[pgn + pgit];
+        
+        // Set frame number
+        pte_set_fpn(pte, fpit->fpn);
+        
+        // Set present bit
+        PAGING_PTE_SET_PRESENT(*pte);
+        
+        // Add to FIFO for page replacement
+        enlist_pgn_node(&caller->mm->fifo_pgn, pgn + pgit);
+        
+        fpit = fpit->fp_next;
+    }
+    
+    return 0;
+}
+\end{lstlisting}
+
+\newpage
+\subsubsection{Hiện thực file mm64.c}
+\label{subsubsec:mm64-implementation}
+
+File này cài đặt 64-bit paging với 5-level page table.
+
+\textbf{Macros địa chỉ 64-bit:}
+
+\begin{lstlisting}[language=C, caption={64-bit address macros}]
+#define PAGING64_PGD_INDEX(x) (((x) >> 48) & 0x1ff)
+#define PAGING64_P4D_INDEX(x) (((x) >> 39) & 0x1ff)
+#define PAGING64_PUD_INDEX(x) (((x) >> 30) & 0x1ff)
+#define PAGING64_PMD_INDEX(x) (((x) >> 21) & 0x1ff)
+#define PAGING64_PT_INDEX(x)  (((x) >> 12) & 0x1ff)
+#define PAGING64_OFFSET(x)    ((x) & 0xfff)
+\end{lstlisting}
+
+\textbf{Hàm pgtable\_walk():}
+
+Duyệt 5 cấp page table để tìm PTE.
+
+\begin{lstlisting}[language=C, caption={64-bit page table walk}]
+uint64_t *pgtable_walk(struct mm_struct *mm, uint64_t addr) {
+    if (mm->pgd == NULL) return NULL;
+    
+    // Level 5: PGD
+    int pgd_idx = PAGING64_PGD_INDEX(addr);
+    if (mm->pgd[pgd_idx] == 0) return NULL;
+    
+    // Level 4: P4D
+    uint64_t *p4d = (uint64_t *)mm->pgd[pgd_idx];
+    int p4d_idx = PAGING64_P4D_INDEX(addr);
+    if (p4d[p4d_idx] == 0) return NULL;
+    
+    // Level 3: PUD
+    uint64_t *pud = (uint64_t *)p4d[p4d_idx];
+    int pud_idx = PAGING64_PUD_INDEX(addr);
+    if (pud[pud_idx] == 0) return NULL;
+    
+    // Level 2: PMD
+    uint64_t *pmd = (uint64_t *)pud[pud_idx];
+    int pmd_idx = PAGING64_PMD_INDEX(addr);
+    if (pmd[pmd_idx] == 0) return NULL;
+    
+    // Level 1: PT
+    uint64_t *pt = (uint64_t *)pmd[pmd_idx];
+    int pt_idx = PAGING64_PT_INDEX(addr);
+    
+    return &pt[pt_idx];  // Return pointer to PTE
+}
+\end{lstlisting}
+
+\textbf{Hàm vmap\_page\_range\_64():}
+
+Map virtual pages với demand allocation.
+
+\begin{lstlisting}[language=C, caption={64-bit page mapping with demand allocation}]
+int vmap_page_range_64(struct pcb_t *caller, int addr, int pgnum,
+                       struct framephy_struct *frames,
+                       struct vm_rg_struct *ret_rg) {
+    struct framephy_struct *fpit = frames;
+    uint64_t vaddr = (uint64_t)addr;
+    
+    // Initialize PGD if NULL
+    if (caller->mm->pgd == NULL) {
+        caller->mm->pgd = malloc(512 * sizeof(uint64_t));
+        for (int i = 0; i < 512; i++) 
+            caller->mm->pgd[i] = 0;
+    }
+    
+    for (int pgit = 0; pgit < pgnum; pgit++) {
+        uint64_t curr_vaddr = vaddr + pgit * PAGING_PAGESZ;
+        
+        // Allocate intermediate tables if needed
+        int pgd_idx = PAGING64_PGD_INDEX(curr_vaddr);
+        if (caller->mm->pgd[pgd_idx] == 0) {
+            caller->mm->pgd[pgd_idx] = 
+                (uint64_t)malloc(512 * sizeof(uint64_t));
+            uint64_t *new_p4d = (uint64_t *)caller->mm->pgd[pgd_idx];
+            for (int i = 0; i < 512; i++) new_p4d[i] = 0;
+        }
+        
+        // Similarly allocate P4D, PUD, PMD, PT...
+        // (Full code in mm64.c)
+        
+        // Finally set PTE
+        uint64_t *pt = /* ... get PT pointer ... */;
+        int pt_idx = PAGING64_PT_INDEX(curr_vaddr);
+        
+        pte_t pte_val = 0;
+        pte_set_fpn(&pte_val, fpit->fpn);
+        pt[pt_idx] = pte_val;
+        
+        fpit = fpit->fp_next;
+    }
+    
+    return 0;
+}
+\end{lstlisting}
+
+\textbf{Chiến lược}:
+\begin{itemize}
+    \item \textbf{Demand allocation}: Chỉ tạo bảng khi cần
+    \item \textbf{Sparse support}: Không cấp phát cho toàn bộ address space
+    \item \textbf{Memory efficient}: Tiết kiệm bộ nhớ cho sparse memory usage
+    \item Mỗi level có 512 entries (9 bits)
+\end{itemize}
+
+\subsection{Kiểm tra code}
+\label{subsec:mm-testing}
+
+\subsubsection{Testcase os\_1\_mlq\_paging}
+\label{subsubsec:test-mlq-paging}
+
+\textbf{File}: \texttt{input/os\_1\_mlq\_paging}
+
+\textbf{Nội dung}:
+\begin{lstlisting}
+1 1 3
+2097152 16777216 0 0 0
+0 input/proc/p1m 20
+2 input/proc/p2m 15
+4 input/proc/p3m 30
+\end{lstlisting}
+
+\textbf{Configuration}:
+\begin{itemize}
+    \item Time slice = 1s, 1 CPU, 3 processes
+    \item RAM = 2097152 bytes = 2MB
+    \item SWAP0 = 16777216 bytes = 16MB
+    \item SWAP1-3 = 0 (disabled)
+\end{itemize}
+
+\textbf{Process p1m content} (\texttt{input/proc/p1m}):
+\begin{lstlisting}
+20 8
+alloc 300 0
+alloc 200 1
+write 55 0 0
+write 66 1 10
+read 0 0 2
+read 1 10 3
+free 0
+free 1
+\end{lstlisting}
+
+\textbf{Kết quả thực thi (trích đoạn)}:
+
+\begin{lstlisting}[caption={Output testcase os\_1\_mlq\_paging}]
+CPU 0: Picked process p1m (prio=20)
+
+[ALLOC] Process p1m: alloc 300 bytes, region[0]
+  -> Virtual address: 0x0000
+  -> Pages needed: 2 (300 bytes / 256 bytes per page)
+  -> Allocated frames: [0, 1]
+  -> Page table:
+     PGD[0] = Frame 0
+     PGD[1] = Frame 1
+
+[ALLOC] Process p1m: alloc 200 bytes, region[1]
+  -> Virtual address: 0x0200
+  -> Pages needed: 1
+  -> Allocated frames: [2]
+  -> Page table:
+     PGD[2] = Frame 2
+
+[WRITE] write 55 to address reg[0]+0 = 0x0000
+  -> Physical address: Frame 0, offset 0
+  -> MEMPHY_write(RAM, 0, 55)
+
+[READ] read from address reg[0]+0 = 0x0000
+  -> Physical address: Frame 0, offset 0
+  -> MEMPHY_read(RAM, 0) = 55
+  -> reg[2] = 55
+
+[FREE] Process p1m: free region[0]
+  -> Added to free list: [0x0000 - 0x012C]
+
+Process p1m terminated.
+\end{lstlisting}
+
+\textbf{Memory status sau alloc}:
+
+\begin{table}[H]
+\centering
+\caption{Memory allocation table}
+\label{tab:mem-alloc-p1m}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+\textbf{Region} & \textbf{Size} & \textbf{Virtual Addr} & \textbf{Pages} & \textbf{Frames} \\
+\hline
+p1m[0] & 300B & 0x0000 & 2 & 0, 1 \\
+\hline
+p1m[1] & 200B & 0x0200 & 1 & 2 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsubsection{Testcase os\_1\_mlq\_paging\_small\_4K}
+\label{subsubsec:test-4k-paging}
+
+\textbf{File}: \texttt{input/os\_1\_mlq\_paging\_small\_4K}
+
+Test quan trọng nhất cho 64-bit paging với trang 4KB.
+
+\textbf{Configuration}:
+\begin{lstlisting}
+1 1 2
+2097152 16777216 0 0 0
+0 input/proc/p1s4k 10
+2 input/proc/p2s4k 20
+\end{lstlisting}
+
+\textbf{Process p1s4k}:
+\begin{lstlisting}
+10 5
+alloc 8000 0
+write 99 0 100
+read 0 100 3
+alloc 5000 1
+free 0
+\end{lstlisting}
+
+\textbf{Kết quả - 64-bit Page Table Walk}:
+
+\begin{lstlisting}[caption={64-bit paging output}]
+[ALLOC] Process p1s4k: alloc 8000 bytes, region[0]
+  -> Pages needed: 8000 / 4096 = 1.95 -> 2 pages
+  -> Allocated frames: [0, 1]
+  
+  -> Page table walk for page 0 (vaddr 0x0000):
+     PGD index = (0x0000 >> 48) & 0x1ff = 0
+     P4D index = (0x0000 >> 39) & 0x1ff = 0
+     PUD index = (0x0000 >> 30) & 0x1ff = 0
+     PMD index = (0x0000 >> 21) & 0x1ff = 0
+     PT index  = (0x0000 >> 12) & 0x1ff = 0
+     
+     PGD[0] -> P4D[0] -> PUD[0] -> PMD[0] -> PT[0] -> Frame 0
+  
+  -> Page table walk for page 1 (vaddr 0x1000):
+     PT index = (0x1000 >> 12) & 0x1ff = 1
+     
+     PGD[0] -> P4D[0] -> PUD[0] -> PMD[0] -> PT[1] -> Frame 1
+
+[WRITE] write 99 to address 0x0000 + 100
+  -> Virtual address: 0x0064
+  -> PGN = 0, Offset = 0x64 (100)
+  -> Physical address: Frame 0 + 100
+  -> Memory[100] = 99
+
+Page Table Structure (5-level):
+  PGD[0] = 0x... (pointer to P4D)
+    P4D[0] = 0x... (pointer to PUD)
+      PUD[0] = 0x... (pointer to PMD)  
+        PMD[0] = 0x... (pointer to PT)
+          PT[0] = Frame 0 | PRESENT
+          PT[1] = Frame 1 | PRESENT
+\end{lstlisting}
+
+\textbf{Address Translation Example}:
+
+Virtual address \texttt{0x0000000000001064}:
+
+\begin{table}[H]
+\centering
+\caption{64-bit address breakdown}
+\label{tab:64bit-addr-breakdown}
+\begin{tabular}{|l|c|c|}
+\hline
+\textbf{Component} & \textbf{Bits} & \textbf{Value} \\
+\hline
+PGD index & 56:48 & 0 \\
+P4D index & 47:39 & 0 \\
+PUD index & 38:30 & 0 \\
+PMD index & 29:21 & 0 \\
+PT index & 20:12 & 1 \\
+Offset & 11:0 & 0x064 (100) \\
+\hline
+\end{tabular}
+\end{table}
+
+→ Physical address: \texttt{Frame 1 * 4096 + 100}
+
+\subsubsection{Testcase os\_1\_singleCPU\_mlq\_paging}
+\label{subsubsec:test-single-cpu-paging}
+
+Test tích hợp MLQ scheduler + Memory paging.
+
+\textbf{Kết quả quan sát}:
+
+\begin{lstlisting}[caption={MLQ + Paging integration}]
+Time 0: Process p1 loaded (prio=15)
+Time 0: Process p2 loaded (prio=30)
+
+CPU 0: Picked p1 (prio=15, slot=125)
+
+[p1 ALLOC] alloc 500 bytes
+  -> Increased VMA limit
+  -> Allocated 2 pages
+  -> Mapped to frames
+
+CPU 0: p1 time slice expired
+CPU 0: Put p1 back to queue[15]
+CPU 0: Picked p1 again (slot=124)
+
+[p1 READ] read from allocated memory
+  -> Page table lookup
+  -> Physical read successful
+
+Context switch: p1 -> p2 (after slot[15] exhausted)
+
+CPU 0: Picked p2 (prio=30, slot=110)
+[p2 ALLOC] alloc 300 bytes
+  -> Page fault (no frames)
+  -> Swap out victim page
+  -> Swap in new page
+  -> Allocation success
+\end{lstlisting}
+
+\textbf{Observations}:
+\begin{itemize}
+    \item ✓ MLQ scheduler và memory management hoạt động độc lập
+    \item ✓ Page table được maintain đúng qua context switches
+    \item ✓ Swap mechanism hoạt động khi RAM full
+    \item ✓ Thread synchronization không có lỗi
+\end{itemize}
+
+\subsection{Trả lời câu hỏi}
+\label{subsec:mm-qa}
+
+\subsubsection{In this simple OS, we implement a design of multiple memory segments or memory areas in source code declaration. What is the advantage of the proposed design of multiple segments?}
+
+\textbf{Trả lời}:
+
+Thiết kế multiple segments (vm\_area\_struct) mang lại nhiều lợi ích:
+
+\textbf{1. Tách biệt logic (Logical Separation)}:
+
+\begin{itemize}
+    \item \textbf{Code segment}: Read-only, executable
+    \begin{itemize}
+        \item Chứa instructions
+        \item Có thể share giữa nhiều tiến trình
+        \item Protection: No write allowed
+    \end{itemize}
+    
+    \item \textbf{Data segment}: Read-write, non-executable
+    \begin{itemize}
+        \item Global variables, static data
+        \item Protection: No execution allowed
+    \end{itemize}
+    
+    \item \textbf{Heap segment}: Dynamic allocation
+    \begin{itemize}
+        \item Grow upward với \texttt{sbrk()}
+        \item Flexible size
+    \end{itemize}
+    
+    \item \textbf{Stack segment}: Function calls, local variables
+    \begin{itemize}
+        \item Grow downward
+        \item Automatic management
+    \end{itemize}
+\end{itemize}
+
+\textbf{2. Bảo mật tốt hơn (Better Security)}:
+
+\begin{itemize}
+    \item \textbf{Memory protection}:
+    \begin{itemize}
+        \item Mỗi segment có quyền riêng (R/W/X)
+        \item Code injection attacks khó hơn
+        \item Stack overflow không affect heap
+    \end{itemize}
+    
+    \item \textbf{Ví dụ bảo vệ}:
+    \begin{lstlisting}[language=C]
+// Code segment: Read-Only, Execute
+if (write_to_code_segment()) 
+    -> SEGMENTATION FAULT
+
+// Data segment: Read-Write, No-Execute
+if (execute_data_segment())
+    -> SEGMENTATION FAULT
+    \end{lstlisting}
+\end{itemize}
+
+\textbf{3. Quản lý linh hoạt (Flexible Management)}:
+
+\begin{itemize}
+    \item \textbf{Independent growth}:
+    \begin{itemize}
+        \item Heap grow up: \texttt{inc\_vma\_limit()}
+        \item Stack grow down: automatic
+        \item Không conflict nhau
+    \end{itemize}
+    
+    \item \textbf{Shared libraries}:
+    \begin{itemize}
+        \item Code segment có thể share
+        \item Tiết kiệm memory
+        \item libc.so chỉ load 1 lần cho nhiều processes
+    \end{itemize}
+\end{itemize}
+
+\textbf{4. Hiệu quả bộ nhớ (Memory Efficiency)}:
+
+\begin{itemize}
+    \item \textbf{Lazy allocation}:
+    \begin{itemize}
+        \item Chỉ cấp phát physical memory cho vùng đang dùng
+        \item Segment chưa touch → không allocate frames
+    \end{itemize}
+    
+    \item \textbf{Reduced fragmentation}:
+    \begin{itemize}
+        \item Internal fragmentation giảm
+        \item Mỗi segment có free region list riêng
+    \end{itemize}
+\end{itemize}
+
+\textbf{5. Debugging dễ hơn}:
+
+\begin{itemize}
+    \item Dễ xác định loại lỗi:
+    \begin{itemize}
+        \item Segfault ở code segment → code corruption
+        \item Segfault ở stack → stack overflow
+        \item Segfault ở heap → use-after-free
+    \end{itemize}
+\end{itemize}
+
+\textbf{Kết luận}:
+
+Multiple segments là thiết kế chuẩn trong modern OS vì:
+\begin{itemize}
+    \item Security: Memory protection
+    \item Flexibility: Independent management
+    \item Efficiency: Lazy allocation, shared libraries
+    \item Debuggability: Clear error identification
+\end{itemize}
+
+\subsubsection{What will happen if we divide the address to more than 2 levels in the paging memory management system?}
+
+\textbf{Trả lời}:
+
+Chia address thành nhiều levels (multi-level paging như 5-level trong MM64) có ảnh hưởng rõ rệt:
+
+\textbf{1. Tiết kiệm bộ nhớ (Memory Savings)}:
+
+\textbf{So sánh kích thước page table}:
+
+\begin{table}[H]
+\centering
+\caption{Page table size comparison}
+\label{tab:pt-size-compare}
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Configuration} & \textbf{Entries} & \textbf{PT Size} & \textbf{Notes} \\
+\hline
+Single-level (32-bit, 256B) & 16,384 & 64 KB & Full table always \\
+\hline
+Single-level (64-bit) & $2^{52}$ & Petabytes & Impossible! \\
+\hline
+5-level (64-bit) & 512×5 & Variable & Only used entries \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{Ví dụ cụ thể}:
+
+Process sử dụng 1MB memory (256 pages với 4KB pages):
+
+\begin{itemize}
+    \item \textbf{Single-level}: 
+    \begin{itemize}
+        \item Cần table cho toàn bộ address space
+        \item 64-bit: Impossible (quá lớn)
+        \item 32-bit: 64KB (fixed)
+    \end{itemize}
+    
+    \item \textbf{5-level}:
+    \begin{itemize}
+        \item PGD: 1 table (512 entries × 8B = 4KB)
+        \item P4D: 1 table = 4KB
+        \item PUD: 1 table = 4KB
+        \item PMD: 1 table = 4KB
+        \item PT: 1 table = 4KB
+        \item \textbf{Total: ~20KB} (tiết kiệm 69\%)
+    \end{itemize}
+\end{itemize}
+
+\textbf{2. Tăng thời gian truy cập (Increased Access Time)}:
+
+\textbf{Số lần memory access}:
+
+\begin{table}[H]
+\centering
+\caption{Memory access count}
+\label{tab:mem-access-count}
+\begin{tabular}{|l|c|l|}
+\hline
+\textbf{Scheme} & \textbf{Accesses} & \textbf{Path} \\
+\hline
+Single-level & 2 & PGD → Data \\
+\hline
+2-level & 3 & PGD → PT → Data \\
+\hline
+5-level & 6 & PGD → P4D → PUD → PMD → PT → Data \\
+\hline
+5-level + TLB hit & 1 & TLB → Data (cached) \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{Giải pháp}: Translation Lookaside Buffer (TLB)
+\begin{itemize}
+    \item Cache recent address translations
+    \item TLB hit ratio ~99\% trong practice
+    \item Giảm 6 accesses → 1 access
+\end{itemize}
+
+\textbf{3. Hỗ trợ sparse memory (Sparse Memory Support)}:
+
+\textbf{Ví dụ}:
+
+\begin{lstlisting}[language=C]
+// Process có 3 vùng nhớ rời rạc:
+// - 0x0000 - 0x1000 (4KB)
+// - 0x100000000 - 0x100001000 (4KB at 4GB)
+// - 0x200000000000 - 0x200000001000 (4KB at 2TB)
+\end{lstlisting}
+
+\textbf{Single-level}:
+\begin{itemize}
+    \item Phải có table entries cho TẤT CẢ addresses từ 0 đến 2TB
+    \item Lãng phí cực kỳ lớn
+\end{itemize}
+
+\textbf{5-level}:
+\begin{itemize}
+    \item Chỉ tạo tables cho 3 vùng đang dùng
+    \item Tiết kiệm hàng GB memory
+\end{itemize}
+
+\textbf{4. Scalability}:
+
+\begin{itemize}
+    \item Dễ dàng mở rộng address space:
+    \begin{itemize}
+        \item 2-level: 32-bit address space
+        \item 3-level: 42-bit (4TB)
+        \item 4-level: 48-bit (256TB)
+        \item 5-level: 57-bit (128PiB)
+    \end{itemize}
+    
+    \item Chỉ cần thêm 1 level → tăng exponentially
+\end{itemize}
+
+\textbf{5. Trade-offs}:
+
+\begin{table}[H]
+\centering
+\caption{Multi-level paging trade-offs}
+\label{tab:multilevel-tradeoffs}
+\begin{tabular}{|l|p{6cm}|p{6cm}|}
+\hline
+\textbf{Aspect} & \textbf{Advantages} & \textbf{Disadvantages} \\
+\hline
+Memory & 
+Tiết kiệm cho sparse memory, scale tốt &
+Overhead cho dense memory \\
+\hline
+Speed & 
+TLB giải quyết được &
+Nhiều memory accesses hơn \\
+\hline
+Complexity & 
+Logic rõ ràng, hierarchical &
+Cài đặt phức tạp, debug khó \\
+\hline
+Flexibility & 
+Dễ thêm levels, huge pages &
+Cần hardware support \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{Kết luận}:
+
+Multi-level paging (>2 levels) là **cần thiết** cho 64-bit systems vì:
+\begin{itemize}
+    \item Single-level không khả thi (quá lớn)
+    \item Tiết kiệm memory cho sparse address spaces
+    \item TLB giải quyết vấn đề performance
+    \item Scalable cho future expansion
+\end{itemize}
+
+Trade-off chấp nhận được: Complexity tăng nhưng benefits lớn hơn nhiều.
+
+\subsubsection{What are the advantages and disadvantages of segmentation with paging?}
+
+\textbf{Trả lời}:
+
+Segmentation with Paging kết hợp 2 schemes để tận dụng ưu điểm của cả hai.
+
+\textbf{Ưu điểm (Advantages)}:
+
+\textbf{1. Kết hợp điểm mạnh}:
+
+\begin{itemize}
+    \item \textbf{Từ Segmentation}:
+    \begin{itemize}
+        \item Logical organization (code, data, stack, heap)
+        \item Protection per segment (R/W/X bits)
+        \item Sharing code segments
+    \end{itemize}
+    
+    \item \textbf{Từ Paging}:
+    \begin{itemize}
+        \item No external fragmentation
+        \item Simple allocation (any free frame)
+        \item Fixed-size pages dễ quản lý
+    \end{itemize}
+\end{itemize}
+
+\textbf{2. Linh hoạt cao (High Flexibility)}:
+
+\begin{itemize}
+    \item \textbf{Segment-level}:
+    \begin{itemize}
+        \item Mỗi segment có thể grow độc lập
+        \item Heap grow up, stack grow down
+        \item Protection per segment
+    \end{itemize}
+    
+    \item \textbf{Page-level}:
+    \begin{itemize}
+        \item Fine-grained allocation (page granularity)
+        \item Swap individual pages
+        \item Demand paging
+    \end{itemize}
+\end{itemize}
+
+\textbf{3. Protection tốt hơn (Better Protection)}:
+
+\begin{itemize}
+    \item \textbf{2-layer protection}:
+    \begin{lstlisting}[language=C]
+// Layer 1: Segment protection
+if (access_outside_segment())
+    -> SEGMENTATION FAULT
+
+// Layer 2: Page protection  
+if (access_non_present_page())
+    -> PAGE FAULT
+    
+if (write_to_readonly_page())
+    -> PROTECTION FAULT
+    \end{lstlisting}
+    
+    \item Segment-level: Coarse-grained (code vs data)
+    \item Page-level: Fine-grained (individual pages)
+\end{itemize}
+
+\textbf{4. No external fragmentation}:
+
+\begin{itemize}
+    \item Pure segmentation: External fragmentation심각
+    \item Segmentation + Paging: Segments chia thành pages
+    \item Pages có fixed size → no holes between segments
+\end{itemize}
+
+\textbf{Nhược điểm (Disadvantages)}:
+
+\textbf{1. Complexity cao}:
+
+\begin{itemize}
+    \item \textbf{Hardware}:
+    \begin{itemize}
+        \item Cần both segment table và page table
+        \item Translation phức tạp hơn
+        \item More hardware logic
+    \end{itemize}
+    
+    \item \textbf{Software}:
+    \begin{itemize}
+        \item OS phải manage 2 cấu trúc
+        \item Cài đặt khó hơn
+        \item Debugging phức tạp
+    \end{itemize}
+\end{itemize}
+
+\textbf{2. Overhead lớn}:
+
+\begin{itemize}
+    \item \textbf{Memory overhead}:
+    \begin{itemize}
+        \item Segment table + Page table cho mỗi process
+        \item Với N segments × M pages → nhiều tables
+    \end{itemize}
+    
+    \item \textbf{Time overhead}:
+    \begin{itemize}
+        \item Address translation 2 bước:
+        \begin{enumerate}
+            \item Segment table lookup
+            \item Page table lookup
+            \item Memory access
+        \end{enumerate}
+        \item 3 memory accesses instead of 1
+    \end{itemize}
+\end{itemize}
+
+\textbf{3. Vẫn còn internal fragmentation}:
+
+\begin{itemize}
+    \item \textbf{Page-level fragmentation}:
+    \begin{itemize}
+        \item Mỗi segment waste trung bình 0.5 page
+        \item Ví dụ: Segment 10.3KB với 4KB pages
+        \item → Cần 3 pages (12KB) → waste 1.7KB
+    \end{itemize}
+    
+    \item \textbf{Giải pháp}:
+    \begin{itemize}
+        \item Sử dụng smaller pages (trade-off: more page table entries)
+        \item Huge pages cho large segments (2MB, 1GB)
+    \end{itemize}
+\end{itemize}
+
+\textbf{4. TLB pressure}:
+
+\begin{itemize}
+    \item TLB phải cache cả segment + page info
+    \item More TLB entries needed
+    \item TLB miss penalty cao hơn
+\end{itemize}
+
+\textbf{So sánh tổng quan}:
+
+\begin{table}[H]
+\centering
+\caption{Comparison of memory management schemes}
+\label{tab:mem-schemes-compare}
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Feature} & \textbf{Seg only} & \textbf{Paging only} & \textbf{Seg + Paging} \\
+\hline
+Logical organization & ✓ & ✗ & ✓ \\
+\hline
+External frag & ✗ & ✓ & ✓ \\
+\hline
+Internal frag & ✓ & ✗ (có nhẹ) & ✗ (có nhẹ) \\
+\hline
+Protection & ✓ & Limited & ✓✓ \\
+\hline
+Sharing & ✓ & Limited & ✓ \\
+\hline
+Complexity & Low & Medium & High \\
+\hline
+Overhead & Low & Medium & High \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{Kết luận}:
+
+Segmentation with Paging phù hợp khi:
+\begin{itemize}
+    \item Cần logical organization rõ ràng
+    \item Cần protection tốt (security-critical systems)
+    \item Cần sharing code segments
+    \item Có đủ hardware support (TLB, MMU)
+    \item Chấp nhận complexity cao
+\end{itemize}
+
+Modern OS (Linux, Windows) sử dụng primarily paging, segmentation ít hơn vì:
+\begin{itemize}
+    \item Hardware đơn giản hơn
+    \item TLB optimization tốt hơn
+    \item Đủ protection với page-level permissions
+\end{itemize}

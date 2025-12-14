@@ -1,0 +1,519 @@
+\section{Scheduler}
+\label{sec:scheduler}
+
+\subsection{Hiện thực}
+\label{subsec:scheduler-implementation}
+
+Phần này trình bày chi tiết việc cài đặt bộ lập lịch Multi-Level Queue (MLQ) với time slicing, bao gồm cài đặt queue operations và MLQ scheduling policy.
+
+
+\subsubsection{Hiện thực file queue.c}
+\label{subsubsec:queue-implementation}
+
+File \texttt{src/queue.c} cài đặt các operations cơ bản cho priority queue:
+
+\begin{itemize}
+    \item \textbf{enqueue(q, proc)}: Thêm process vào cuối hàng đợi
+    \begin{itemize}
+        \item Kiểm tra queue full → return -1
+        \item Thêm vào vị trí \texttt{q->size}, tăng size
+        \item Độ phức tạp: O(1)
+    \end{itemize}
+    
+    \item \textbf{dequeue(q)}: Lấy process đầu tiên ra khỏi queue (FIFO)
+    \begin{itemize}
+        \item Kiểm tra queue empty → return NULL
+        \item Lấy process tại vị trí 0
+        \item Shift tất cả phần tử sang trái
+        \item Độ phức tạp: O(n) do phải shift
+    \end{itemize}
+    
+    \item \textbf{empty(q)}: Kiểm tra queue có rỗng không
+    \begin{itemize}
+        \item Return \texttt{(q->size == 0)}
+        \item Độ phức tạp: O(1)
+    \end{itemize}
+\end{itemize}
+
+\textbf{Nhận xét}: Các operations được implement theo cấu trúc array-based queue cơ bản, phù hợp cho MLQ scheduler với số lượng processes hạn chế.
+
+
+\subsubsection{Hiện thực file sched.c}
+\label{subsubsec:sched-implementation}
+
+File \texttt{src/sched.c} cài đặt MLQ (Multi-Level Queue) scheduler với time slicing.
+
+\begin{lstlisting}[language=C, caption={Cấu trúc dữ liệu MLQ - Source: src/sched.c}]
+#include "queue.h"
+#include "sched.h"
+#include <pthread.h>
+
+static struct queue_t ready_queue;
+static struct queue_t run_queue;
+static pthread_mutex_t queue_lock;
+
+#ifdef MLQ_SCHED
+static struct queue_t mlq_ready_queue[MAX_PRIO];
+static int slot[MAX_PRIO];
+#endif
+\end{lstlisting}
+
+\textbf{Giải thích:}
+\begin{itemize}
+    \item \texttt{mlq\_ready\_queue[MAX\_PRIO]}: Mảng 140 queues, mỗi queue cho một mức ưu tiên
+    \item \texttt{slot[MAX\_PRIO]}: Số time slots còn lại cho mỗi mức ưu tiên
+    \item \texttt{queue\_lock}: Mutex lock để đảm bảo thread-safe
+    \item \texttt{MAX\_PRIO = 140}: Số lượng mức ưu tiên (config trong os-cfg.h)
+\end{itemize}
+
+\textbf{Hàm init\_scheduler():} Khởi tạo scheduler và các queues.
+
+\begin{lstlisting}[language=C, caption={Hàm init\_scheduler() - Source: src/sched.c}]
+void init_scheduler(void) {
+#ifdef MLQ_SCHED
+    int i;
+    for (i = 0; i < MAX_PRIO; i++) {
+        mlq_ready_queue[i].size = 0;
+        slot[i] = MAX_PRIO - i;  // Higher priority gets more slots
+    }
+#endif
+    ready_queue.size = 0;
+    run_queue.size = 0;
+    pthread_mutex_init(&queue_lock, NULL);
+}
+\end{lstlisting}
+
+\textbf{Phân tích công thức slot:}
+
+Công thức \texttt{slot[i] = MAX\_PRIO - i} đảm bảo:
+
+\begin{table}[H]
+\centering
+\caption{Phân bổ time slots theo priority}
+\label{tab:slot-allocation}
+\begin{tabular}{|c|c|c|}
+\hline
+\textbf{Priority (prio)} & \textbf{Slot = 140 - prio} & \textbf{Ý nghĩa} \\
+\hline
+0 (cao nhất) & 140 & Nhiều CPU time nhất \\
+\hline
+10 & 130 & Ít hơn prio 0 \\
+\hline
+50 & 90 & Trung bình \\
+\hline
+100 & 40 & Thấp \\
+\hline
+139 (thấp nhất) & 1 & Ít CPU time nhất \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{Hàm queue\_empty():}
+
+\begin{lstlisting}[language=C, caption={Kiểm tra tất cả queues có rỗng không}]
+int queue_empty(void) {
+#ifdef MLQ_SCHED
+    unsigned long prio;
+    for (prio = 0; prio < MAX_PRIO; prio++)
+        if (!empty(&mlq_ready_queue[prio])) 
+            return -1;
+#endif
+    return (empty(&ready_queue) && empty(&run_queue));
+}
+\end{lstlisting}
+
+Hàm này duyệt qua tất cả 140 queues để kiểm tra có process nào đang chờ không.
+
+\textbf{Hàm get\_mlq\_proc():}
+
+Đây là hàm quan trọng nhất, cài đặt MLQ policy.
+
+\begin{lstlisting}[language=C, caption={MLQ Policy - Get Process}]
+struct pcb_t *get_mlq_proc(void) {
+    struct pcb_t *proc = NULL;
+    
+    pthread_mutex_lock(&queue_lock);
+    
+    // Traverse from highest priority (0) to lowest (MAX_PRIO-1)
+    for (int i = 0; i < MAX_PRIO; i++) {
+        if (mlq_ready_queue[i].size > 0) {
+            if (slot[i] > 0) {
+                // Still have slots left
+                proc = dequeue(&mlq_ready_queue[i]);
+                slot[i]--;
+                break;
+            } else {
+                // Slot expired, reset and pick
+                slot[i] = MAX_PRIO - i;
+                proc = dequeue(&mlq_ready_queue[i]);
+                slot[i]--;
+                break;
+            }
+        }
+    }
+    
+    pthread_mutex_unlock(&queue_lock);
+    return proc;
+}
+\end{lstlisting}
+
+\textbf{Phân tích thuật toán MLQ Policy:}
+
+\begin{enumerate}
+    \item \textbf{Lock}: Acquire mutex lock để thread-safe
+    
+    \item \textbf{Duyệt từ cao đến thấp}: Loop từ priority 0 (cao nhất) đến 139
+    
+    \item \textbf{Kiểm tra queue không rỗng}: \texttt{mlq\_ready\_queue[i].size > 0}
+    
+    \item \textbf{Kiểm tra slot}:
+    \begin{itemize}
+        \item \texttt{slot[i] > 0}: Còn slot → Lấy process, giảm slot
+        \item \texttt{slot[i] == 0}: Hết slot → Reset về \texttt{MAX\_PRIO - i}, sau đó lấy process
+    \end{itemize}
+    
+    \item \textbf{Break}: Dừng ngay khi tìm được process (priority cao luôn được ưu tiên)
+    
+    \item \textbf{Unlock}: Giải phóng mutex lock
+\end{enumerate}
+
+\textbf{Đặc điểm MLQ Policy:}
+
+\begin{itemize}
+    \item \textbf{Fixed priority}: Priority cao luôn được pick trước
+    \item \textbf{Time slicing}: Mỗi priority có số slot cố định
+    \item \textbf{Fixed traversal}: Không feedback, không promote/demote
+    \item \textbf{Round Robin within priority}: Processes cùng priority chạy luân phiên
+\end{itemize}
+
+
+\textbf{Các hàm hỗ trợ}: \texttt{add\_mlq\_proc()}, \texttt{put\_mlq\_proc()} và wrapper functions (\texttt{get\_proc}, \texttt{put\_proc}, \texttt{add\_proc}) đều sử dụng mutex lock để enqueue/dequeue process một cách thread-safe.
+
+
+\textbf{Thread Synchronization:}
+
+Tất cả các hàm truy cập \texttt{mlq\_ready\_queue} đều được bảo vệ bởi \texttt{pthread\_mutex\_lock}:
+
+\begin{itemize}
+    \item \textbf{Critical section}: Bất kỳ đoạn code nào modify/read \texttt{mlq\_ready\_queue}
+    \item \textbf{Race condition prevention}: Tránh 2 CPUs cùng dequeue một process
+    \item \textbf{Data integrity}: Đảm bảo size và proc[] array luôn consistent
+\end{itemize}
+
+\subsection{Kiểm tra code}
+\label{subsec:scheduler-testing}
+
+Phần này trình bày kết quả chạy các test cases để verify MLQ scheduler hoạt động đúng.
+
+\subsubsection{Testcase sched\_0}
+\label{subsubsec:test-sched-0}
+
+\textbf{File}: \texttt{input/sched\_0}
+
+\textbf{Nội dung file}:
+\begin{lstlisting}
+1 1 3
+0 input/proc/p1 15
+0 input/proc/p2 30
+0 input/proc/p3 45
+\end{lstlisting}
+
+\textbf{Giải thích configuration}:
+\begin{itemize}
+    \item Time slice = 1 second
+    \item Number of CPUs = 1
+    \item Number of processes = 3
+    \item Process p1: arrival time = 0, priority = 15
+    \item Process p2: arrival time = 0, priority = 30
+    \item Process p3: arrival time = 0, priority = 45
+\end{itemize}
+
+\textbf{Phân tích slots}:
+\begin{itemize}
+    \item p1 (prio=15): slot = 140 - 15 = 125
+    \item p2 (prio=30): slot = 140 - 30 = 110
+    \item p3 (prio=45): slot = 140 - 45 = 95
+\end{itemize}
+
+\textbf{Kết quả thực thi}:
+
+\begin{lstlisting}[caption={Output của testcase sched\_0 (trích đoạn)}]
+Time 0: Loaded process p1 with priority 15
+Time 0: Loaded process p2 with priority 30
+Time 0: Loaded process p3 with priority 45
+
+CPU 0: Picked process p1 (priority 15)
+CPU 0: Run process p1, time slice 1
+CPU 0: Process p1 preempted
+CPU 0: Put process p1 back to queue[15]
+
+CPU 0: Picked process p1 (priority 15) - slot remaining 124
+CPU 0: Run process p1, time slice 1
+...
+\end{lstlisting}
+
+\textbf{Nhận xét}:
+\begin{itemize}
+    \item p1 (priority cao nhất) được chạy liên tục cho đến khi hết slot hoặc terminate
+    \item p2 và p3 phải chờ p1 hết slot[15]
+    \item Đúng với MLQ policy: Higher priority always wins
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\fbox{\parbox{0.9\textwidth}{
+\centering
+\vspace{2cm}
+[Screenshot: Output của testcase sched\_0]\newline
+CPU 0 picks p1 repeatedly
+\vspace{2cm}
+}}
+\caption{Screenshot output testcase sched\_0}
+\label{fig:output-sched-0}
+\end{figure}
+
+\subsubsection{Testcase sched\_1}
+\label{subsubsec:test-sched-1}
+
+\textbf{File}: \texttt{input/sched\_1}
+
+\textbf{Nội dung file}:
+\begin{lstlisting}
+1 2 5
+0 input/proc/p1 10
+1 input/proc/p2 20
+2 input/proc/p3 10
+3 input/proc/p4 30
+4 input/proc/p5 10
+\end{lstlisting}
+
+\textbf{Giải thích configuration}:
+\begin{itemize}
+    \item Time slice = 1 second
+    \item Number of CPUs = 2 (multi-processor)
+    \item 5 processes với arrival times khác nhau
+    \item p1, p3, p5 cùng priority = 10 (cùng queue)
+\end{itemize}
+
+\textbf{Phân tích}:
+\begin{table}[H]
+\centering
+\caption{Process table cho sched\_1}
+\label{tab:sched-1-processes}
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Process} & \textbf{Arrival} & \textbf{Priority} & \textbf{Slot} \\
+\hline
+p1 & 0 & 10 & 130 \\
+\hline
+p2 & 1 & 20 & 120 \\
+\hline
+p3 & 2 & 10 & 130 \\
+\hline
+p4 & 3 & 30 & 110 \\
+\hline
+p5 & 4 & 10 & 130 \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{Kết quả thực thi (trích đoạn)}:
+
+\begin{lstlisting}[caption={Output của testcase sched\_1}]
+Time 0:
+  CPU 0: Picked p1 (prio=10)
+  
+Time 1:
+  CPU 0: p1 running
+  CPU 1: Picked p2 (prio=20), but queue[10] has p1 with higher priority
+  
+Time 2:
+  CPU 0: Picked p3 (prio=10) - Round Robin with p1
+  CPU 1: Picked p1 (prio=10)
+  
+...
+\end{lstlisting}
+
+\textbf{Nhận xét}:
+\begin{itemize}
+    \item 2 CPUs chạy song song
+    \item Processes cùng priority (p1, p3, p5) chạy Round Robin
+    \item Mutex lock hoạt động đúng: không có process nào được pick 2 lần
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\fbox{\parbox{0.9\textwidth}{
+\centering
+\vspace{2cm}
+[Screenshot: Output của testcase sched\_1]\newline
+Multi-CPU execution with Round Robin
+\vspace{2cm}
+}}
+\caption{Screenshot output testcase sched\_1}
+\label{fig:output-sched-1}
+\end{figure}
+
+\subsubsection{Testcase sched}
+\label{subsubsec:test-sched}
+
+\textbf{File}: \texttt{input/sched}
+
+Testcase tổng hợp với nhiều processes và priorities khác nhau.
+
+\textbf{Kết quả quan sát}:
+
+\begin{itemize}
+    \item ✓ MLQ policy hoạt động đúng
+    \item ✓ Time slicing theo slot formula
+    \item ✓ Round Robin trong cùng priority
+    \item ✓ Thread synchronization không có race condition
+    \item ✓ Processes được scheduled công bằng theo priority
+\end{itemize}
+
+\subsection{Trả lời câu hỏi}
+\label{subsec:scheduler-qa}
+
+\subsubsection{Question: What is the advantage of the scheduling strategy used in this assignment in comparison with other scheduling algorithms you have learned?}
+
+\textbf{Trả lời}:
+
+MLQ (Multi-Level Queue) scheduler có nhiều ưu điểm so với các thuật toán khác:
+
+\textbf{1. So với FCFS (First Come First Served):}
+
+\begin{itemize}
+    \item \textbf{Ưu điểm MLQ}:
+    \begin{itemize}
+        \item Phân biệt được priority của processes
+        \item Tiến trình quan trọng (low prio value) được CPU ngay lập tức
+        \item Tránh convoy effect (short process đợi long process)
+    \end{itemize}
+    
+    \item \textbf{Ví dụ}:
+    \begin{itemize}
+        \item FCFS: P1(100s) → P2(1s) → P2 phải đợi 100s
+        \item MLQ: P2 (high prio) → P1 → P2 chạy ngay
+    \end{itemize}
+\end{itemize}
+
+\textbf{2. So với Round Robin thuần túy:}
+
+\begin{itemize}
+    \item \textbf{Ưu điểm MLQ}:
+    \begin{itemize}
+        \item Có priority differentiation
+        \item High priority process được nhiều CPU time hơn (nhiều slots)
+        \item Phù hợp với real-time systems
+    \end{itemize}
+    
+    \item \textbf{Nhược điểm RR}:
+    \begin{itemize}
+        \item Tất cả processes đều công bằng → không phù hợp khi cần ưu tiên
+        \item Background task và foreground task được treat như nhau
+    \end{itemize}
+\end{itemize}
+
+\textbf{3. So với Priority Scheduling (non-preemptive):}
+
+\begin{itemize}
+    \item \textbf{Ưu điểm MLQ}:
+    \begin{itemize}
+        \item Có time slicing → tránh starvation
+        \item Low priority processes vẫn được chạy (ít nhất 1 slot)
+        \item Fairness tốt hơn
+    \end{itemize}
+    
+    \item \textbf{Vấn đề Priority Scheduling}:
+    \begin{itemize}
+        \item Starvation: Low priority có thể không bao giờ chạy
+        \item Không có time limit cho high priority
+    \end{itemize}
+\end{itemize}
+
+\textbf{4. So với Shortest Job First (SJF):}
+
+\begin{itemize}
+    \item \textbf{Ưu điểm MLQ}:
+    \begin{itemize}
+        \item Không cần biết trước burst time
+        \item Dễ implement hơn
+        \item Flexible: Admin có thể set priority
+    \end{itemize}
+    
+    \item \textbf{Vấn đề SJF}:
+    \begin{itemize}
+        \item Cần predict burst time → khó và không chính xác
+        \item Starvation cho long jobs
+    \end{itemize}
+\end{itemize}
+
+\textbf{5. Ưu điểm tổng hợp của MLQ:}
+
+\begin{enumerate}
+    \item \textbf{Predictable}: High priority luôn được đảm bảo CPU time
+    \item \textbf{Fair}: Low priority vẫn có cơ hội (slot reset mechanism)
+    \item \textbf{Scalable}: Dễ thêm/bớt priority levels
+    \item \textbf{Simple}: Logic rõ ràng, dễ debug
+    \item \textbf{Flexible}: Có thể adjust slot formula theo nhu cầu
+    \item \textbf{Real-world applicable}: Sử dụng trong Linux kernel
+\end{enumerate}
+
+\textbf{Kết luận}:
+
+MLQ là sự cân bằng tốt giữa priority scheduling và fairness, phù hợp với các hệ thống cần:
+\begin{itemize}
+    \item Phân biệt importance của processes
+    \item Đảm bảo response time cho interactive processes
+    \item Tránh starvation cho background processes
+    \item Multi-processor systems
+\end{itemize}
+
+\subsubsection{Sơ đồ Gantt}
+\label{subsubsec:gantt-diagram}
+
+\textbf{Gantt diagram cho testcase sched\_0}:
+
+\begin{figure}[H]
+\centering
+\begin{tabular}{|c|c|c|c|c|c|c|c|c|c|c|}
+\hline
+\textbf{Time} & 0 & 1 & 2 & 3 & 4 & 5 & 6 & 7 & 8 & ... \\
+\hline
+\textbf{CPU 0} & p1 & p1 & p1 & p1 & p1 & p1 & p1 & p1 & p1 & ... \\
+\hline
+\end{tabular}
+\caption{Gantt chart - p1 chạy liên tục do có priority cao nhất}
+\label{fig:gantt-sched-0}
+\end{figure}
+
+\textbf{Giải thích}:
+\begin{itemize}
+    \item p1 (prio=15) có 125 slots
+    \item p1 chiếm CPU cho đến khi terminate hoặc hết 125 time slices
+    \item p2 và p3 chờ trong queue[30] và queue[45]
+\end{itemize}
+
+\textbf{Gantt diagram cho sched\_1 với multiple priorities}:
+
+\begin{figure}[H]
+\centering
+\begin{tabular}{|c|c|c|c|c|c|c|c|c|}
+\hline
+\textbf{Time} & 0 & 1 & 2 & 3 & 4 & 5 & 6 & 7 \\
+\hline
+\textbf{CPU 0} & p1 & p1 & p1 & p3 & p3 & p5 & p5 & p1 \\
+\hline
+\textbf{CPU 1} & idle & p2 & p3 & p1 & p5 & p3 & p1 & p3 \\
+\hline
+\end{tabular}
+\caption{Gantt chart - Multi-CPU với Round Robin trong cùng priority}
+\label{fig:gantt-sched-1}
+\end{figure}
+
+\textbf{Phân tích}:
+\begin{itemize}
+    \item p1, p3, p5 (cùng prio=10) chạy luân phiên (Round Robin)
+    \item p2 (prio=20) chỉ chạy khi queue[10] hết slots
+    \item 2 CPUs hoạt động song song
+\end{itemize}

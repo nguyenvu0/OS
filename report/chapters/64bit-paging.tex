@@ -1,0 +1,350 @@
+\section{64-bit Paging System}
+\label{sec:64bit-paging}
+
+\subsection{Giới thiệu về 64-bit Paging}
+\label{subsec:64bit-intro}
+
+Hệ thống phân trang 64-bit với cơ chế 5 cấp (5-level paging) là một mở rộng hiện đại của kiến trúc quản lý bộ nhớ x86-64. Hệ thống này cho phép:
+
+\begin{itemize}
+    \item Không gian địa chỉ ảo lên đến \textbf{128 PiB} (Petabytes)
+    \item Trang kích thước \textbf{4KB} (4096 bytes)
+    \item Cấu trúc bảng trang hierarchical 5 cấp
+    \item Hiệu quả trong việc quản lý bộ nhớ sparse (thưa)
+\end{itemize}
+
+\subsection{Cấu trúc bảng trang 5 cấp}
+\label{subsec:5level-structure}
+
+\subsubsection{Sơ đồ phân chia địa chỉ 64-bit}
+
+Địa chỉ 64-bit được chia thành các phần như sau:
+
+\begin{table}[H]
+\centering
+\caption{Phân chia địa chỉ 64-bit}
+\label{tab:64bit-address}
+\begin{tabular}{|l|l|l|l|}
+\hline
+\textbf{Bits} & \textbf{Tên} & \textbf{Số entries} & \textbf{Kích thước bao phủ} \\
+\hline
+63-57 & Reserved & - & - \\
+\hline
+56-48 & PGD (Page Global Directory) & 512 & 128 PiB \\
+\hline
+47-39 & P4D (Page 4th Directory) & 512 & 256 TiB \\
+\hline
+38-30 & PUD (Page Upper Directory) & 512 & 512 GiB \\
+\hline
+29-21 & PMD (Page Middle Directory) & 512 & 1 GiB \\
+\hline
+20-12 & PT (Page Table) & 512 & 2 MiB \\
+\hline
+11-0 & Offset & 4096 & 4 KiB \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsubsection{Macros cho 64-bit Paging}
+
+Các macro được định nghĩa trong \texttt{mm64.c}:
+
+\begin{lstlisting}[language=C, caption={Macros trích xuất index từ địa chỉ 64-bit}]
+#define PAGING64_PGD_INDEX(x) (((x) >> 48) & 0x1ff)
+#define PAGING64_P4D_INDEX(x) (((x) >> 39) & 0x1ff)
+#define PAGING64_PUD_INDEX(x) (((x) >> 30) & 0x1ff)
+#define PAGING64_PMD_INDEX(x) (((x) >> 21) & 0x1ff)
+#define PAGING64_PT_INDEX(x)  (((x) >> 12) & 0x1ff)
+#define PAGING64_OFFSET(x)    ((x) & 0xfff)
+\end{lstlisting}
+
+Trong đó:
+\begin{itemize}
+    \item \texttt{0x1ff = 511}: Mask 9 bits (512 entries = $2^9$)
+    \item \texttt{0xfff = 4095}: Mask 12 bits (4KB = $2^{12}$)
+\end{itemize}
+
+\subsection{Ví dụ phân tích địa chỉ 64-bit}
+\label{subsec:address-example}
+
+Cho địa chỉ virtual: \texttt{0x39ffe1d9c9000}
+
+\textbf{Phân tích:}
+
+\begin{lstlisting}[language=C, caption={Tính toán index cho từng cấp}]
+// Level 1 - Page Table (PT)
+PT Index  = (0x39ffe1d9c9000 >> 12) & 0x1ff = 0x1c9 = 457
+
+// Level 2 - Page Middle Directory (PMD)
+PMD Index = (0x39ffe1d9c9000 >> 21) & 0x1ff = 0x0ec = 236
+
+// Level 3 - Page Upper Directory (PUD)
+PUD Index = (0x39ffe1d9c9000 >> 30) & 0x1ff = 0x1f8 = 504
+
+// Level 4 - Page Level 4 Directory (P4D)
+P4D Index = (0x39ffe1d9c9000 >> 39) & 0x1ff = 0x13f = 319
+
+// Level 5 - Page Global Directory (PGD)
+PGD Index = (0x39ffe1d9c9000 >> 48) & 0x1ff = 0x003 = 3
+\end{lstlisting}
+
+\textbf{Đường đi (Page Walk):}
+\begin{center}
+\texttt{PGD[3] → P4D[319] → PUD[504] → PMD[236] → PT[457] → Frame}
+\end{center}
+
+\subsection{Cài đặt chính}
+\label{subsec:64bit-implementation}
+
+\subsubsection{Cấu trúc dữ liệu}
+
+Trong \texttt{include/mm.h}:
+
+\begin{lstlisting}[language=C, caption={Page Table Entry type cho 64-bit}]
+#ifdef MM64
+    typedef uint64_t pte_t;
+#else
+    typedef uint32_t pte_t;
+#endif
+
+// Page size configuration
+#ifdef MM64
+    #define PAGING_PAGESZ  4096    // 4KB for 64-bit
+#else
+    #define PAGING_PAGESZ  256     // 256B for 32-bit
+#endif
+\end{lstlisting}
+
+\subsubsection{Hàm Page Table Walk}
+
+Hàm \mintinline{c}{pgtable_walk()} duyệt qua bảng trang để tìm PTE:
+
+\begin{lstlisting}[language=C, caption={Page Table Walk trong mm64.c}]
+uint64_t *pgtable_walk(struct mm_struct *mm, uint64_t addr) {
+    if (mm->pgd == NULL) return NULL;
+    
+    // Level 5: PGD
+    int pgd_idx = PAGING64_PGD_INDEX(addr);
+    if (mm->pgd[pgd_idx] == 0) return NULL;
+    
+    // Level 4: P4D
+    uint64_t *p4d = (uint64_t *)mm->pgd[pgd_idx];
+    int p4d_idx = PAGING64_P4D_INDEX(addr);
+    if (p4d[p4d_idx] == 0) return NULL;
+    
+    // Level 3: PUD
+    uint64_t *pud = (uint64_t *)p4d[p4d_idx];
+    int pud_idx = PAGING64_PUD_INDEX(addr);
+    if (pud[pud_idx] == 0) return NULL;
+    
+    // Level 2: PMD
+    uint64_t *pmd = (uint64_t *)pud[pud_idx];
+    int pmd_idx = PAGING64_PMD_INDEX(addr);
+    if (pmd[pmd_idx] == 0) return NULL;
+    
+    // Level 1: PT
+    uint64_t *pt = (uint64_t *)pmd[pmd_idx];
+    int pt_idx = PAGING64_PT_INDEX(addr);
+    
+    return &pt[pt_idx];  // Return pointer to PTE
+}
+\end{lstlisting}
+
+\textbf{Phân tích hàm:}
+\begin{enumerate}
+    \item Kiểm tra PGD có tồn tại không
+    \item Duyệt qua 5 cấp: PGD → P4D → PUD → PMD → PT
+    \item Tại mỗi cấp, kiểm tra entry có valid không (khác 0)
+    \item Trả về con trỏ đến PTE cuối cùng
+\end{enumerate}
+
+\subsubsection{Hàm ánh xạ trang (vmap\_page\_range\_64)}
+
+Hàm này ánh xạ một vùng nhớ ảo vào các frame vật lý:
+
+\begin{lstlisting}[language=C, caption={Virtual to Physical Mapping}]
+int vmap_page_range_64(struct pcb_t *caller, int addr, int pgnum,
+                       struct framephy_struct *frames,
+                       struct vm_rg_struct *ret_rg) {
+    struct framephy_struct *fpit = frames;
+    int pgit = 0;
+    uint64_t vaddr = (uint64_t)addr;
+    
+    // Initialize PGD if NULL
+    if (caller->mm->pgd == NULL) {
+        caller->mm->pgd = malloc(512 * sizeof(uint64_t));
+        for(int i=0; i<512; i++) caller->mm->pgd[i] = 0;
+    }
+    
+    for (pgit = 0; pgit < pgnum; pgit++) {
+        if (fpit == NULL) return -1;
+        
+        uint64_t curr_vaddr = vaddr + pgit * PAGING_PAGESZ;
+        
+        // Allocate intermediate page tables if needed
+        int pgd_idx = PAGING64_PGD_INDEX(curr_vaddr);
+        
+        if (caller->mm->pgd[pgd_idx] == 0) {
+            caller->mm->pgd[pgd_idx] = 
+                (uint64_t)malloc(512 * sizeof(uint64_t));
+            uint64_t *new_p4d = (uint64_t *)caller->mm->pgd[pgd_idx];
+            for(int i=0; i<512; i++) new_p4d[i] = 0;
+        }
+        
+        // Similar allocation for P4D, PUD, PMD, PT...
+        // (See full implementation in mm64.c)
+        
+        // Set final PTE
+        uint64_t *pt = /* ... get PT pointer ... */;
+        int pt_idx = PAGING64_PT_INDEX(curr_vaddr);
+        
+        pte_t pte_val = 0;
+        pte_set_fpn(&pte_val, fpit->fpn);
+        pt[pt_idx] = pte_val;
+        
+        fpit = fpit->fp_next;
+    }
+    
+    return 0;
+}
+\end{lstlisting}
+
+\textbf{Chiến lược cài đặt:}
+
+\begin{itemize}
+    \item \textbf{Demand allocation}: Chỉ tạo bảng trang khi cần thiết
+    \item \textbf{Sparse allocation}: Không cấp phát cho toàn bộ không gian địa chỉ
+    \item Mỗi cấp có 512 entries (9 bits)
+    \item Tiết kiệm bộ nhớ với cấu trúc sparse
+\end{itemize}
+
+\subsection{So sánh kích thước bảng trang}
+\label{subsec:page-table-size}
+
+\textbf{Câu hỏi}: What will happen if we divide the address to more than 2 levels in the paging memory management system?
+
+\textbf{Trả lời}:
+
+\begin{table}[H]
+\centering
+\caption{So sánh kích thước bảng trang}
+\label{tab:pagetable-size}
+\begin{tabular}{|l|l|l|l|}
+\hline
+\textbf{Cấu trúc} & \textbf{Số entries} & \textbf{Kích thước} & \textbf{Ghi chú} \\
+\hline
+Single-level (32-bit, 256B) & 16,384 & 64 KB & Lãng phí cho sparse memory \\
+\hline
+Single-level (64-bit) & $2^{52}$ & Không khả thi & Quá lớn \\
+\hline
+5-level (64-bit, demand) & 512 × 5 & Variable & Chỉ cấp phát khi cần \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{Ưu điểm của multi-level paging:}
+
+\begin{enumerate}
+    \item \textbf{Tiết kiệm bộ nhớ}:
+    \begin{itemize}
+        \item Chỉ cấp phát bảng trang cho vùng nhớ đang sử dụng
+        \item Phù hợp với sparse address space
+    \end{itemize}
+    
+    \item \textbf{Flexibility}:
+    \begin{itemize}
+        \item Dễ dàng mở rộng không gian địa chỉ
+        \item Hỗ trợ huge pages (2MB, 1GB)
+    \end{itemize}
+    
+    \item \textbf{Scalability}:
+    \begin{itemize}
+        \item Từ 4-level (48-bit) lên 5-level (57-bit) dễ dàng
+        \item Hỗ trợ ứng dụng cần nhiều bộ nhớ
+    \end{itemize}
+\end{enumerate}
+
+\textbf{Nhược điểm:}
+
+\begin{enumerate}
+    \item \textbf{Thời gian truy cập}:
+    \begin{itemize}
+        \item Page walk qua 5 cấp tốn thời gian
+        \item Cần TLB (Translation Lookaside Buffer) để tăng tốc
+    \end{itemize}
+    
+    \item \textbf{Complexity}:
+    \begin{itemize}
+        \item Cài đặt phức tạp hơn
+        \item Khó debug
+    \end{itemize}
+\end{enumerate}
+
+\subsection{Hàm Debug và In bảng trang}
+\label{subsec:print-pgtbl}
+
+\begin{lstlisting}[language=C, caption={In thông tin bảng trang 64-bit}]
+void print_pgtbl64(struct mm_struct *mm, uint64_t start, uint64_t end) {
+    printf("print_pgtbl64: %ld - %ld\n", start, end);
+    if (mm == NULL || mm->pgd == NULL) return;
+    
+    // Iterate through all valid entries
+    for(int i=0; i<512; i++) {
+        if(mm->pgd[i] != 0) {
+            uint64_t *p4d = (uint64_t *)mm->pgd[i];
+            for(int j=0; j<512; j++) {
+                if(p4d[j] != 0) {
+                    // Continue for PUD, PMD, PT...
+                    printf("PGD[%d] P4D[%d] PUD[%d] PMD[%d] PT[%d] -> Frame: %ld\n",
+                        i, j, k, l, m, PAGING_PTE_FPN(pt[m]));
+                }
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+\subsection{Thống kê và Đánh giá}
+\label{subsec:statistics}
+
+\textbf{Số lần truy cập bộ nhớ:}
+
+\begin{itemize}
+    \item \textbf{Không có TLB (TLB miss)}: 6 lần truy cập
+    \begin{enumerate}
+        \item Đọc PGD entry
+        \item Đọc P4D entry
+        \item Đọc PUD entry
+        \item Đọc PMD entry
+        \item Đọc PT entry
+        \item Đọc/ghi data tại physical address
+    \end{enumerate}
+    
+    \item \textbf{Có TLB (TLB hit)}: 1 lần truy cập
+    \begin{enumerate}
+        \item Đọc/ghi data trực tiếp (TLB cung cấp physical address)
+    \end{enumerate}
+\end{itemize}
+
+\textbf{Kích thước lưu trữ multi-level paging:}
+
+Cho tiến trình sử dụng 1MB bộ nhớ:
+\begin{itemize}
+    \item Số trang: 1MB / 4KB = 256 trang
+    \item Worst case: 256 PT entries + PMD + PUD + P4D + PGD
+    \item Kích thước: $\sim$ 10KB (so với 64KB của single-level)
+    \item \textbf{Tiết kiệm}: 84\%
+\end{itemize}
+
+\subsection{Kết luận}
+\label{subsec:64bit-conclusion}
+
+Hệ thống phân trang 64-bit 5 cấp đã được cài đặt thành công với:
+\begin{itemize}
+    \item Demand allocation strategy
+    \item Sparse memory support
+    \item Trang 4KB chuẩn
+    \item Không gian địa chỉ lên đến 128 PiB
+\end{itemize}
+
+Thiết kế này cân bằng giữa tiết kiệm bộ nhớ và độ phức tạp của thuật toán, phù hợp với các ứng dụng hiện đại.

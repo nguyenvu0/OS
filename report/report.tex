@@ -1,0 +1,97 @@
+% 'draft' mode can be used to speed up compilation
+\documentclass[twoside,final]{hcmut-report}
+\usepackage{codespace}
+
+% Draft watermark
+% https://github.com/callegar/LaTeX-draftwatermark
+
+% Encodings
+\usepackage{gensymb,textcomp}
+
+% Better tables
+% Wide tables go to https://tex.stackexchange.com/q/332902
+\usepackage{array,longtable,multicol,multirow,siunitx,tabularx}
+
+% Better enum
+\usepackage{enumitem}
+
+% Graphics
+\usepackage{caption,float}
+
+% Add options for figures, like max width, framing, etc.
+\usepackage[export]{adjustbox}
+
+% References
+% Use \cref{} or \Cref{} instead of \ref{}
+\usepackage[nameinlink]{cleveref}
+
+% Configurations
+\coursename{Hệ điều hành (Operating Systems)}
+\reporttype{Báo cáo bài tập lớn}
+\title{OS Simulation - Multi-Level Queue Scheduler với 64-bit Paging}
+\advisor{& Nguyễn Quang Hùng &\\
+          & Nguyễn Minh Tâm &  \\
+}
+\stuname{%
+  & Lưu Nguyên Vũ & 2314058  \\
+  & Huỳnh Anh Chí Kiệt & 2013563 \\
+
+}
+
+% Allow page breaks inside align* environment
+%\allowdisplaybreaks{}
+
+% Makes a lot of things blue, avoid at all costs
+%\everymath{\color{blue}}
+
+% Set depth of numbering for counters
+\AtBeginDocument{\counterwithin{lstlisting}{section}}
+
+% Rename some sections
+%\AtBeginDocument{\renewcommand*{\contentsname}{Contents}}
+%\AtBeginDocument{\renewcommand*{\refname}{References}}
+%\AtBeginDocument{\renewcommand*{\bibname}{References}}
+
+% Custom commands
+%\newcommand*\mean[1]{\bar{#1}}
+
+\begin{document}
+\coverpage%
+
+\section*{Danh sách thành viên \& Phân công công việc}
+\newcounter{memberrowno}
+\setcounter{memberrowno}{0}
+\begin{center}
+  \begin{tabular}{>{\stepcounter{memberrowno}\thememberrowno}llcc}
+    \toprule
+    \multicolumn{1}{c}{\textbf{STT}} & \textbf{Họ và tên} & \textbf{MSSV} & \textbf{Đóng góp} \\
+    \midrule
+                                     & Luu Nguyên Vũ & 2314058  & 100\%             \\
+                                     & Huỳnh Anh Chí Kiệt & 2013563 & 100\%             \\
+
+    \bottomrule
+  \end{tabular}
+\end{center}
+\clearpage
+
+\tableofcontents
+\listoffigures
+\listoftables
+\lstlistoflistings{}
+
+\clearpage
+
+% Main content chapters
+\input{chapters/01-scheduler.tex}
+\input{chapters/02-memory-management.tex}
+\input{chapters/03-system-call.tex}
+
+% Bibliography
+\clearpage
+\bibliographystyle{plain}
+\bibliography{refs/example.bib}
+%\nocite{*}
+
+\end{document}
+
+

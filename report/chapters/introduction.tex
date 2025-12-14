@@ -1,0 +1,87 @@
+\section{Giới thiệu}
+\label{sec:introduction}
+
+\subsection{Tổng quan về dự án}
+\label{subsec:overview}
+
+Đồ án này thực hiện mô phỏng một hệ điều hành đơn giản (Simple Operating System) nhằm giúp sinh viên hiểu rõ các khái niệm cơ bản về lập lịch (scheduling), đồng bộ hóa (synchronization) và quản lý bộ nhớ (memory management). Dự án được phát triển dựa trên yêu cầu của môn Hệ điều hành, Khoa Khoa học và Kỹ thuật Máy tính, Đại học Bách Khoa TP.HCM.
+
+Hệ điều hành mô phỏng này được thiết kế để hoạt động trên phần cứng ảo (virtual hardware) và quản lý hai tài nguyên ảo chính:
+\begin{itemize}
+    \item \textbf{CPU(s)}: Được quản lý bởi bộ lập lịch (Scheduler) và bộ phân phối (Dispatcher)
+    \item \textbf{RAM}: Được quản lý bởi hệ thống bộ nhớ ảo (Virtual Memory Engine)
+\end{itemize}
+
+\subsection{Mục tiêu}
+\label{subsec:objectives}
+
+Mục tiêu chính của đồ án bao gồm:
+
+\begin{enumerate}
+    \item Hiểu và cài đặt thuật toán lập lịch Multi-Level Queue (MLQ) với time slicing
+    \item Hiểu và cài đặt cơ chế phân trang 64-bit với cấu trúc bảng trang 5 cấp
+    \item Cài đặt hệ thống quản lý bộ nhớ ảo (virtual memory) với cơ chế swap
+    \item Đảm bảo đồng bộ hóa đa luồng (multi-threading synchronization) sử dụng pthread mutex
+    \item Thiết kế và cài đặt giao diện lập trình hệ thống (system call interface)
+\end{enumerate}
+
+\subsection{Các tính năng đã cài đặt}
+\label{subsec:features}
+
+Nhóm đã hoàn thành cài đặt các tính năng chính sau:
+
+\subsubsection{Multi-Level Queue (MLQ) Scheduler}
+
+Bộ lập lịch MLQ được cài đặt với các đặc điểm:
+\begin{itemize}
+    \item Hỗ trợ \mintinline{c}{MAX_PRIO = 140} mức độ ưu tiên
+    \item Mỗi mức ưu tiên có một hàng đợi riêng biệt
+    \item Time slicing: Mỗi mức ưu tiên có số slot riêng (slot = MAX\_PRIO - prio)
+    \item Round Robin trong cùng mức ưu tiên
+    \item Thread-safe với \mintinline{c}{pthread_mutex_t queue_lock}
+\end{itemize}
+
+\subsubsection{64-bit Paging System}
+
+Hệ thống phân trang 64-bit với cấu trúc bảng trang 5 cấp (5-level page table):
+\begin{itemize}
+    \item \textbf{PGD} (Page Global Directory) - 512 entries - bit[56:48]
+    \item \textbf{P4D} (Page 4th Directory) - 512 entries - bit[47:39]
+    \item \textbf{PUD} (Page Upper Directory) - 512 entries - bit[38:30]
+    \item \textbf{PMD} (Page Middle Directory) - 512 entries - bit[29:21]
+    \item \textbf{PT} (Page Table) - 512 entries - bit[20:12]
+    \item \textbf{Offset} - bit[11:0]
+\end{itemize}
+
+Kích thước trang: \textbf{4KB} (4096 bytes), cho phép không gian bộ nhớ ảo lên đến 128 PiB.
+
+\subsubsection{Memory Management}
+
+Hệ thống quản lý bộ nhớ bao gồm:
+\begin{itemize}
+    \item Quản lý RAM vật lý với danh sách free frame
+    \item Cơ chế swap memory giữa RAM và SWAP space
+    \item Hỗ trợ nhiều memory segments (vm\_area\_struct)
+    \item Symbol table đơn giản cho quản lý regions
+    \item Thread-safe với \mintinline{c}{pthread_mutex_t mm_lock}
+\end{itemize}
+
+\subsubsection{Synchronization}
+
+Đồng bộ hóa đa luồng được đảm bảo thông qua:
+\begin{itemize}
+    \item \mintinline{c}{queue_lock} trong scheduler để bảo vệ ready queues
+    \item \mintinline{c}{mm_lock} trong memory management để bảo vệ cấu trúc bộ nhớ
+    \item Các critical sections được xác định rõ ràng
+\end{itemize}
+
+\subsection{Cấu trúc báo cáo}
+\label{subsec:report-structure}
+
+Báo cáo được tổ chức như sau:
+\begin{itemize}
+    \item \textbf{Chương 2}: Trình bày chi tiết thiết kế và cài đặt MLQ Scheduler
+    \item \textbf{Chương 3}: Trình bày chi tiết thiết kế và cài đặt hệ thống phân trang 64-bit
+    \item \textbf{Chương 4}: Trình bày chi tiết hệ thống quản lý bộ nhớ
+    \item \textbf{Chương 5}: Trình bày kết quả testing và đánh giá
+\end{itemize}
